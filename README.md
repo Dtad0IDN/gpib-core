@@ -77,7 +77,7 @@ The test binary accepts a suite-count argument for bisecting:
 | `src/proto.c` | all IEEE-488.1 FSMs (normative-extract traceable) |
 | `src/mod4882.c` | 488.2 registers, STB computation, common-command parser |
 | `src/epoch.c` `src/trace.c` `src/port_null.c` | identity manager, binary trace ring, null port |
-| `tests/` | 24 suites: lifecycle/ledger/mailbox/interleaving/litmus, protocol vectors, line simulation, E2E against simulated instruments (two per bus), dual-core TCT, device-role E2E, 488.2 unit + slice, optional features (TE/LE, PP1, FINDLSTN, REQUESTCTL), S2 oracle, **independent wire oracle O1-O12 (T04: a partner sharing ZERO protocol code with the core — own handshake, own command table, waveform trace, per-DRIVE interception, wire conflict invariants, honest `safe_detached`)**; plus the 4-config matrix binaries |
+| `tests/` | 24 suites: lifecycle/ledger/mailbox/interleaving/litmus, protocol vectors, line simulation, E2E against simulated instruments (two per bus), dual-core TCT, device-role E2E, 488.2 unit + slice, optional features (TE/LE, PP1, FINDLSTN, REQUESTCTL), S2 oracle, **independent wire oracle O1-O14 (T04: a partner sharing ZERO protocol code with the core — own handshake, own command table, waveform trace, per-DRIVE interception, wire conflict invariants, honest `safe_detached`)**; plus the 4-config matrix binaries |
 | `docs/norms/` | verified engineering extracts: 488.1 timing, Annex B sequence, SH/AH+commands, T/L/C/SR, RL/DC/DT, 488.2 controller protocols |
 
 ## Architecture (what runs where)
@@ -244,7 +244,10 @@ CTest runs 7 targets: s1, device_smoke, 4x matrix, bigcfg).
 **Traceability:** every audit item is either fixed with a regression
 test or explicitly deferred below — F01-F26 (IEEE review, 2026-10-31),
 T01-T16 (test audit), R6-01..R6-04 (Rev6), R7-01 (Rev7), T8-01/T8-02
-(Rev8). The PP1 function is verified against the §2.9 extract; RL/DC/DT
+(Rev8), and the Rev9 recommendations (final-accept-pulse sequence test,
+REQUESTCTL stuck-port fault injection, exact teardown busy reason with
+port recovery, silent-on-green diagnostics, a dedicated oracle CTest
+target). The PP1 function is verified against the §2.9 extract; RL/DC/DT
 against §5; SH/AH against the SH/AH extract; controller protocols
 against the 488.2 extract. The REN low-time anchoring for ports with
 pre-existing physical history is a documented port contract

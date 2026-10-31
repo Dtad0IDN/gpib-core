@@ -131,3 +131,8 @@ else()
         -Wall -Wextra -Wpedantic -Werror -Wshadow -Wundef)
 endif()
 add_test(NAME bigcfg COMMAND test_bigcfg)
+
+# R9 §4: the oracle suite also runs as its OWN CTest target (suite #24)
+# -- a mutant killed by an earlier suite must not mask the oracle's
+# sensitivity in the aggregate run.
+add_test(NAME oracle COMMAND test_s1 24)

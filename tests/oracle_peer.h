@@ -22,7 +22,10 @@
  * invariants online (DIO stable while DAV asserted; no ATN flip mid
  * byte), so tests can assert on the observed wire, not on core state. */
 
-#define ORACLE_TRACE_MAX 1024u
+/* Waveform ring: sized for the LONGEST single scenario (O8 chains
+ * WRITE+READ+SPOLL+PPOLL+IFC under REN, ~1500 rounds); wedged scenarios
+ * (O14) opt out via trace_enabled instead of overflowing. */
+#define ORACLE_TRACE_MAX 2048u
 #define ORACLE_CMD_LOG_MAX 64u
 #define ORACLE_RX_MAX 256u
 
@@ -94,6 +97,7 @@ typedef struct oracle_peer {
     bool tx_armed;
     bool tx_eoi_last;
     bool tx_stall; /* fault injection: never asserts DAV (O6) */
+    bool freeze_clock; /* fault injection (O14): snap time stops */
     int tx_phase; /* 0=wait_rfd 1=dav_hold 2=wait_ndac_clear */
     bool stb_mode; /* serial-poll answer overrides tx */
     bool stb_sent;
@@ -121,6 +125,7 @@ typedef struct oracle_peer {
     oracle_trace_t trace[ORACLE_TRACE_MAX];
     size_t trace_len;
     bool trace_overflow;   /* Rev6 §5.4: ring exhausted -- must stay 0 */
+    bool trace_enabled;    /* O14 wedged scenarios may disable the ring */
     unsigned violations;    /* invariant breaches (must stay 0) */
     unsigned viol_atn;      /* split for diagnosis: ATN mid-byte flips */
     unsigned viol_conflict; /* split for diagnosis: vbus conflicts */
@@ -135,6 +140,10 @@ typedef struct oracle_peer {
 } oracle_peer_t;
 
 void oracle_init(oracle_peer_t *p, vbus_t *bus, int core_id, uint8_t addr);
+
+/* The honest safe_detached evidence function (installed by oracle_init);
+ * tests that override the callback can restore it through this alias. */
+bool oracle_port_safe_detached(void *user);
 
 /* Script the talker reply (EOI on the last byte when eoi_last). */
 void oracle_arm_reply(oracle_peer_t *p, const uint8_t *data, size_t n,

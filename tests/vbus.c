@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <string.h>
 
 #include "vbus.h"
@@ -92,8 +91,6 @@ void vbus_drive_dio(vbus_t *b, int id, uint8_t value) {
             /* T07: TWO talkers is a contention even when the bytes
              * happen to match -- identical data must not pass as legal. */
             b->conflicts++;
-            fprintf(stderr, "[vbus] DIO conflict: id=%d val=0x%02X vs "
-                "id=%d val=0x%02X\n", id, value, i, b->dio_value[i]);
         }
         if (b->pp_active[i]) {
             b->conflicts++; /* domain crossing: talker vs parallel poll */

@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <string.h>
 
 #include "oracle_peer.h"
@@ -205,9 +204,6 @@ static void talker_round(oracle_peer_t *p, bool atn, bool nrfd, bool ndac) {
         o_set(p, VBL_DAV, true);
         o_set(p, VBL_EOI, eoi_on);
         if (!ndac) {
-            fprintf(stderr, "[tk] t=%llu phase2 exit pos=%zu/%zu b=0x%02X\n",
-                (unsigned long long)p->now_us, pos, len,
-                stb_mode ? (uint8_t)(p->stb | 0x40u) : p->tx[pos]);
             o_set(p, VBL_DAV, false);
             o_set(p, VBL_EOI, false);
             /* 488.1: the source may drop its DIO drivers as soon as the
@@ -294,7 +290,10 @@ static bool o_read_lines(void *user, gpib_line_snap_t *snap) {
     o_set(p, VBL_SRQ, p->srq_asserted);
 
     vbus_tick(p->bus);
-    p->now_us++;
+    if (!p->freeze_clock) {
+        p->now_us++; /* O14 freezes the snapshot time: every FSM timing
+                      * window (T1/T3/probe/deadline) stops elapsing */
+    }
 
     /* The CORE observes the post-tick levels: everything driven this
      * round (ours included) is visible in the same snapshot. */
@@ -328,19 +327,21 @@ static bool o_read_lines(void *user, gpib_line_snap_t *snap) {
         p->viol_conflict++;
         p->conflicts_prev = p->bus->conflicts;
     }
-    if (p->trace_len < ORACLE_TRACE_MAX) {
-        oracle_trace_t *t = &p->trace[p->trace_len++];
-        t->atn = atn ? 1 : 0;
-        t->eoi = eoi ? 1 : 0;
-        t->dav = dav ? 1 : 0;
-        t->nrfd = nrfd ? 1 : 0;
-        t->ndac = ndac ? 1 : 0;
-        t->ifc = ifc ? 1 : 0;
-        t->ren = ren ? 1 : 0;
-        t->srq = srq ? 1 : 0;
-        t->dio = dio;
-    } else {
-        p->trace_overflow = true;
+    if (p->trace_enabled) {
+        if (p->trace_len < ORACLE_TRACE_MAX) {
+            oracle_trace_t *t = &p->trace[p->trace_len++];
+            t->atn = atn ? 1 : 0;
+            t->eoi = eoi ? 1 : 0;
+            t->dav = dav ? 1 : 0;
+            t->nrfd = nrfd ? 1 : 0;
+            t->ndac = ndac ? 1 : 0;
+            t->ifc = ifc ? 1 : 0;
+            t->ren = ren ? 1 : 0;
+            t->srq = srq ? 1 : 0;
+            t->dio = dio;
+        } else {
+            p->trace_overflow = true;
+        }
     }
     p->dav_prev = dav;
     return true;
@@ -431,12 +432,17 @@ static bool o_arm(void *user) {
 }
 
 static bool o_detached(void *user) {
-    oracle_peer_t *p = (oracle_peer_t *)user;
     /* T8-01: PROOF, not a stub -- true only when the core participant
      * asserts nothing on the wire. The core earns this by releasing at
      * the STOPPING->DRAINING boundary; a lying port would certify an
      * electrically live detach. */
+    oracle_peer_t *p = (oracle_peer_t *)user;
     return vbus_participant_clean(p->bus, p->core_id);
+}
+
+bool oracle_port_safe_detached(void *user) {
+    /* Public alias for tests that swap safe_detached and restore it. */
+    return o_detached(user);
 }
 
 static bool o_quiesced(void *user) {
@@ -462,6 +468,7 @@ void oracle_init(oracle_peer_t *p, vbus_t *bus, int core_id, uint8_t addr) {
     p->base.safe_detached = o_detached;
     p->base.executor_quiesced = o_quiesced;
     p->core_dio_prev = 0xFFu;
+    p->trace_enabled = true; /* the ring records by default (O14 opts out) */
     vbus_attach_as(bus, p->self_id);
 }
 

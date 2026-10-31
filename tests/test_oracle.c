@@ -17,9 +17,10 @@ static uint8_t s_rx_buf[64];
 
 /* Rev7 §5.4: one clean-exit gate for every oracle scenario. */
 static void oracle_assert_clean(const oracle_peer_t *p) {
-    if (p->violations != 0u || p->trace_overflow) {
-        fprintf(stderr, "[clean] viol=%u atn=%u confl=%u (dioerr path)\n",
-            p->violations, p->viol_atn, p->viol_conflict);
+    if (p->violations != 0u || p->trace_overflow || p->trace_len > 1900u) {
+        fprintf(stderr, "[clean] viol=%u atn=%u confl=%u len=%zu ovf=%d\n",
+            p->violations, p->viol_atn, p->viol_conflict,
+            (size_t)p->trace_len, (int)p->trace_overflow);
     }
     CHECK(p->violations == 0);
     CHECK(!p->trace_overflow);
@@ -666,11 +667,15 @@ static void oracle_o12_detach_safety(void) {
         CHECK(gpib_remote_enable(&ctx, true) == GPIB_OK);
         {
             int guard = 0;
-            while (!ctx.line.sc_ren && guard++ < 20000) {
+            /* R9 §4.1: wait for the FSM flag AND the physical WIRE --
+             * a port may lag the model by a round. */
+            while ((!ctx.line.sc_ren || !vbus_level(&bus, VBL_REN)) &&
+                   guard++ < 20000) {
                 CHECK(gpib_process(&ctx) == GPIB_OK);
             }
             REQUIRE(guard < 20000);
         }
+        REQUIRE(vbus_level(&bus, VBL_REN)); /* proven before shutdown */
         CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
         CHECK(gpib_process(&ctx) == GPIB_OK);
         CHECK(gpib_deinit(&ctx) == GPIB_OK); /* detach earned */
@@ -700,10 +705,165 @@ static void oracle_o12_detach_safety(void) {
         }
         CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
         CHECK(gpib_process(&ctx) == GPIB_OK);
-        CHECK(gpib_deinit(&ctx) != GPIB_OK); /* refused: teardown pending */
+        /* R9 §4.2: the exact BUSY status AND the machine-readable
+         * reason -- not just "not OK". */
+        CHECK(gpib_deinit(&ctx) == GPIB_BUSY_RESOURCES);
+        CHECK(ctx.last_busy_reason == GPIB_BUSY_PORT_TEARDOWN_PENDING);
         CHECK(ctx.lifecycle == (uint8_t)GPIB_LC_DRAINING); /* still live */
+        /* Recovery: once the port can certify again, deinit succeeds --
+         * the refusal must be a busy state, never a dead end. */
+        peer.base.safe_detached = oracle_port_safe_detached;
+        CHECK(gpib_deinit(&ctx) == GPIB_OK);
+        CHECK(vbus_participant_clean(&bus, 0));
         oracle_assert_clean(&peer);
     }
+}
+
+/* O13 (R9 §3 recommendation, receive_final_ndac_ack_on_wire): the LAST
+ * byte's completion sequence, round by round on the wire: (1) the accept
+ * pulse round -- NDAC released while DAV still held and the byte still
+ * driven; (2) the source reacts -- DAV drops and the DIO drivers go off;
+ * (3) from then on the stop state holds both handshake lines. No API
+ * completion may precede the physical acknowledgement of the talker. */
+static void oracle_o13_final_ack_sequence(void) {
+    GPIB_CONTEXT_STORAGE_DEFINE(ctx);
+    vbus_t bus;
+    oracle_peer_t peer;
+    gpib_handle_t t = { 0, 0, 0, 0, 0 };
+    gpib_handle_t b = { 0, 0, 0, 0, 0 };
+    gpib_result_t res;
+    gpib_request_t r;
+    vbus_init(&bus);
+    vbus_attach_as(&bus, 0);
+    oracle_init(&peer, &bus, 0, 6);
+    oracle_arm_reply(&peer, s_reply, sizeof(s_reply), true);
+    {
+        gpib_init_params_t ip;
+        memset(&ip, 0, sizeof(ip));
+        ip.system_controller = true;
+        ip.own_address.primary = 5;
+        ip.port = &peer.base;
+        CHECK(gpib_init(&ctx, &ip) == GPIB_OK);
+        CHECK(gpib_start(&ctx) == GPIB_OK);
+    }
+    memset(&r, 0, sizeof(r));
+    r.kind = GPIB_REQ_READ;
+    r.address.primary = 6;
+    r.rx_data = s_rx_buf;
+    r.rx_cap = sizeof(s_reply);
+    CHECK(gpib_submit(&ctx, &r, &t, &b) == GPIB_OK);
+    res = o_wait(&ctx, t);
+    CHECK(res.reason == GPIB_TERM_COMPLETED);
+    CHECK(res.end_cause == GPIB_END_EOI);
+    {
+        /* Trace granularity note: the oracle reacts to the accept pulse
+         * inside the same read_lines call that first observes it, so
+         * the wire picture per round is: (1) the END byte held (DAV+EOI,
+         * byte on the lines, NDAC asserted); (2) the acknowledgement
+         * round -- NDAC released (the pulse) and the source ALREADY
+         * reacted: DAV down, DIO drivers off; (3) from the next round
+         * the stop state holds both lines. */
+        size_t held = 0;
+        bool found = false;
+        for (size_t i = 0; i + 1u < peer.trace_len; i++) {
+            const oracle_trace_t *tr = &peer.trace[i];
+            const oracle_trace_t *nx = &peer.trace[i + 1u];
+            if (!tr->atn && tr->dav && tr->eoi && tr->ndac &&
+                tr->dio == s_reply[sizeof(s_reply) - 1u] &&
+                !nx->atn && !nx->dav && !nx->ndac && nx->dio == 0u) {
+                held = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            size_t from = peer.trace_len > 12 ? peer.trace_len - 12 : 0;
+            for (size_t i = from; i < peer.trace_len; i++) {
+                fprintf(stderr, "[o13] %zu: atn=%u eoi=%u dav=%u nrfd=%u "
+                    "ndac=%u dio=0x%02X\n", i, peer.trace[i].atn,
+                    peer.trace[i].eoi, peer.trace[i].dav,
+                    peer.trace[i].nrfd, peer.trace[i].ndac,
+                    peer.trace[i].dio);
+            }
+        }
+        REQUIRE(found);
+        /* (3) stop state from the round after the acknowledgement. */
+        bool transition_allowed = true;
+        for (size_t i = held + 2u; i < peer.trace_len; i++) {
+            if (peer.trace[i].dav) {
+                transition_allowed = true;
+                continue;
+            }
+            CHECK(peer.trace[i].nrfd == 1u);
+            if (transition_allowed) {
+                transition_allowed = false;
+            } else {
+                CHECK(peer.trace[i].ndac == 1u);
+            }
+        }
+    }
+    CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
+    CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
+    oracle_assert_clean(&peer);
+    CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
+    CHECK(gpib_process(&ctx) == GPIB_OK);
+    CHECK(gpib_deinit(&ctx) == GPIB_OK);
+}
+
+/* O14 (R6-04 fault injection, requestctl_stuck_port): with a frozen
+ * snapshot clock the internal FINDRQS can never progress; the composite
+ * must hit its bound, cancel+drain the action and return
+ * BUSY_RESOURCES -- leaving a usable instance behind (no hang, no
+ * uncontrolled live action writing into instance memory). */
+static void oracle_o14_requestctl_stuck(void) {
+    GPIB_CONTEXT_STORAGE_DEFINE(ctx);
+    vbus_t bus;
+    oracle_peer_t peer;
+    gpib_handle_t t = { 0, 0, 0, 0, 0 };
+    gpib_handle_t b = { 0, 0, 0, 0, 0 };
+    uint8_t addrs[1] = { 6 };
+    size_t found = 0;
+    vbus_init(&bus);
+    vbus_attach_as(&bus, 0);
+    oracle_init(&peer, &bus, 0, 6);
+    oracle_set_stb(&peer, 0x40u, true); /* a real requester exists */
+    {
+        gpib_init_params_t ip;
+        memset(&ip, 0, sizeof(ip));
+        ip.system_controller = true;
+        ip.own_address.primary = 5;
+        ip.port = &peer.base;
+        CHECK(gpib_init(&ctx, &ip) == GPIB_OK);
+        CHECK(gpib_start(&ctx) == GPIB_OK);
+    }
+    {
+        int guard = 0;
+        while ((ctx.line.ctrl.main != GPIB_C_CACS) && guard++ < 20000) {
+            CHECK(gpib_process(&ctx) == GPIB_OK);
+        }
+        REQUIRE(guard < 20000);
+    }
+    /* Freeze the SNAPSHOT clock: every handshake timing window (T1, the
+     * empty-bus probe, deadlines) stops elapsing -- the internal FINDRQS
+     * cannot progress, exactly a wedged port. */
+    peer.freeze_clock = true;
+    peer.trace_enabled = false; /* wedged rounds exhaust any ring */
+    CHECK(gpib_requestctl_pass(&ctx, addrs, 1, &found, &t, &b) ==
+          GPIB_BUSY_RESOURCES); /* bounded failure, no hang */
+    peer.freeze_clock = false;
+    peer.trace_enabled = true;
+    /* The instance is still usable: the drain recovered, shutdown and
+     * deinit complete normally once the clock runs again. */
+    CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
+    {
+        int guard = 0;
+        while (ctx.lifecycle != (uint8_t)GPIB_LC_DRAINING && guard++ < 20000) {
+            CHECK(gpib_process(&ctx) == GPIB_OK);
+        }
+        REQUIRE(guard < 20000);
+    }
+    CHECK(gpib_deinit(&ctx) == GPIB_OK);
+    oracle_assert_clean(&peer);
 }
 
 void suite_oracle(void) {
@@ -717,4 +877,6 @@ void suite_oracle(void) {
     oracle_o7_ifc_reset();
     oracle_o8_sc_persistence();
     oracle_o12_detach_safety();
+    oracle_o13_final_ack_sequence();
+    oracle_o14_requestctl_stuck();
 }
