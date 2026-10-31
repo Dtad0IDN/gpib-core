@@ -6,32 +6,40 @@ zero heap, single static context. Implementation of
 the normative extracts in `docs/norms/`.
 
 **Status: host-level ТЗ scope + the optional layer are functionally
-complete.** Both roles (Controller / Device) run the real IEEE-488.1
-protocol engine on a wired-OR line model; all mandatory 488.2 control
-sequences and protocols (§16.2, §17.1/17.3) plus FINDRQS, the RECEIVE
-stop conditions, and the optional features — TE/LE secondary addressing,
-PP1 parallel poll, FINDLSTN, REQUESTCTL/PASSCTL — are implemented and
-verified end-to-end against simulated instruments and core-to-core.
-The §2.9 PP extract arrived and the PP1 FSM was brought to full
-Fig. 11 conformance (both state groups, Table 25 output semantics).
-An external IEEE-488 audit (2026-10-31) was triaged item-by-item and
-worked through: F01 external-IFC device reset (+E2E), F03/F16 TCT
-modeling, F04 device-core PP1 (core-to-core E2E), F05 READ stream
-sessions (ONE RECEIVE per response, NRFD backpressure between blocks),
-F09/F10 addressed-command qualification, F11 own-address reinit,
-F12 primary-address range gates, F13 RECEIVE stop state, F14 strict
-T8/REN-low timings, F15 steal-observer fix, F18 SR round evaluation,
-F22-F25 module E conformance (*RST, PMT variants, QYE semantics,
-full-token parser), plus the T03 drive-structure UB fix, T01/T02/T08/T14
-test-infrastructure repairs and the F02/F17 C-model synchronization
-(gts/tca/rpp fed from the sequencer: CSBS/CPWS/CPPS reachable and
-asserted). Remaining: independent wire-oracle test partner (T04),
-stream/interrupt robustness details, level-2 hardware adapters and VT
+complete; four external re-audits (Rev5-Rev8, 2026-10-31/11-01) triaged
+item-by-item and closed with regressions.** Both roles (Controller /
+Device) run the real IEEE-488.1 protocol engine on a wired-OR line
+model; all mandatory 488.2 control sequences and protocols (§16.2,
+§17.1/17.3) plus FINDRQS, the RECEIVE stop conditions, and the optional
+features — TE/LE secondary addressing, PP1 parallel poll, FINDLSTN,
+REQUESTCTL/PASSCTL — are implemented and verified end-to-end against
+simulated instruments and core-to-core. The §2.9 PP extract arrived and
+the PP1 FSM was brought to full Fig. 11 conformance (both state groups,
+Table 25 output semantics). The audit campaign closed: F01 external-IFC
+device reset (+E2E), F02/F17 C-model synchronization (gts/tca/rpp fed
+from the sequencer), F03/F16 TCT modeling, F04 device-core PP1
+(core-to-core E2E), F05 READ stream sessions (ONE RECEIVE per response,
+NRFD backpressure between blocks), F06/F07/F08/F12 contract hardening,
+F09/F10 addressed-command qualification, F11 own-address reinit, F13
+RECEIVE stop state, F14 strict T8/REN-low timings, F15 steal-observer,
+F18 SR round evaluation, F22-F25 module E conformance, the T03
+drive-structure UB, T01/T02/T08/T14 test infrastructure, R6-01 REN
+determinism (poisoned-memory regression), R6-02/R7-01 stop-state and
+SC-line continuity (the single drive composer: REN/IFC persist through
+EVERY drive; the off-bus detach releases them exactly once at
+STOPPING→DRAINING, and the test ports certify `safe_detached` from the
+wire instead of stubbing it), R6-03 mid-session re-addressing refused,
+R6-04 composite results moved to instance memory, T8-01/T8-02 honest
+port contracts + per-drive intent invariants. The **independent wire
+oracle (T04)** — built last — has already found three real core bugs no
+FSM-shared test could see (see the reviewer section). Remaining: the
+REQUESTCTL composite lifecycle fault-injection, independent
+multi-controller takeover tests, level-2 hardware adapters and VT
 benches (see "Not implemented (deliberate)" below).
 
 ## Build & test (host)
 
-MinGW GCC, no dependencies — builds SIX binaries and runs them all:
+MinGW GCC, no dependencies — builds SEVEN binaries and runs them all:
 
 ```
 powershell -ExecutionPolicy Bypass -File build.ps1
@@ -39,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 | Binary | Purpose |
 |---|---|
-| `test_s1` | Controller-role full suite (24 suites, 147 069 checks) |
+| `test_s1` | Controller-role full suite (24 suites, 147 328 checks) |
 | `test_device` | Device-role E2E against a simulated controller (425 checks) |
 | `matrix_c_full/min`, `matrix_d_full/min` | 4-configuration CI matrix (role × profile), mandatory-subset parity + G-MEM RAM report (2176 / 1064 bytes) |
 | `test_bigcfg` | compile-time border configuration (MAX_LISTENERS=11, MAX_CMDS=13) |
@@ -63,13 +71,13 @@ The test binary accepts a suite-count argument for bisecting:
 | `include/gpib/gpib_4882.h` | module E: 488.2 status model + common commands |
 | `src/core.c` | lifecycle, process, emergency, recover, snapshots, DF events, IFC/REN requests |
 | `src/submit.c` | submit/cancel + every operation constructor (write/read/write_many/spoll/allspoll/findrqs/reset/TCT/CMDS/device supply/sink/ppoll_configure/ppoll_unconfigure/parallel_poll/findlstn/request_control/requestctl_pass) |
-| `src/lineexec.c` | line-level sequencer: CMD/DATA_TX/DATA_RX/EPILOGUE/POLL_ADDR/PPOLL_IDY/FINDLSTN_PROBE/DEV_WAIT phases, SC-line merge, DF events |
+| `src/lineexec.c` | line-level sequencer: CMD/DATA_TX/DATA_RX/EPILOGUE/POLL_ADDR/PPOLL_IDY/FINDLSTN_PROBE/DEV_WAIT phases, the single drive composer (SC lines persist through every drive, R7-01), the off-bus electrical detach at STOPPING→DRAINING (T8-01), external-IFC reset, READ stream sessions, DF events |
 | `src/executor.c` | mailbox host model: action slot, stop latch, accounting |
 | `src/ledger.c` `src/results.c` | block ledger, transaction terminal records, views |
 | `src/proto.c` | all IEEE-488.1 FSMs (normative-extract traceable) |
 | `src/mod4882.c` | 488.2 registers, STB computation, common-command parser |
 | `src/epoch.c` `src/trace.c` `src/port_null.c` | identity manager, binary trace ring, null port |
-| `tests/` | 24 suites: lifecycle/ledger/mailbox/interleaving/litmus, protocol vectors, line simulation, E2E against simulated instruments (two per bus), dual-core TCT, device-role E2E, 488.2 unit + slice, optional features (TE/LE, PP1, FINDLSTN, REQUESTCTL), S2 oracle, **independent wire oracle (T04: a partner sharing ZERO protocol code with the core — own handshake, own command table, waveform trace + wire invariants)**; plus the 4-config matrix binaries |
+| `tests/` | 24 suites: lifecycle/ledger/mailbox/interleaving/litmus, protocol vectors, line simulation, E2E against simulated instruments (two per bus), dual-core TCT, device-role E2E, 488.2 unit + slice, optional features (TE/LE, PP1, FINDLSTN, REQUESTCTL), S2 oracle, **independent wire oracle O1-O12 (T04: a partner sharing ZERO protocol code with the core — own handshake, own command table, waveform trace, per-DRIVE interception, wire conflict invariants, honest `safe_detached`)**; plus the 4-config matrix binaries |
 | `docs/norms/` | verified engineering extracts: 488.1 timing, Annex B sequence, SH/AH+commands, T/L/C/SR, RL/DC/DT, 488.2 controller protocols |
 
 ## Architecture (what runs where)
@@ -133,8 +141,12 @@ The test binary accepts a suite-count argument for bisecting:
   receiver CIDS→CADS→CACS and holds ATN.
 - System controller lines (C2/C3): `gpib_interface_clear` (T8 pulse,
   resets instrument interface functions within t4), `gpib_remote_enable`
-  (persistent SRAS). SC lines merge INTO every sequencer drive (never
-  clobber DAV/ATN of an active transfer).
+  (persistent SRAS; the low-time window is anchored to the actual wire
+  release edge, R6-01/F14). SC lines merge INTO every sequencer drive
+  through the single composer (R7-01: an exchange-scoped release can
+  never drop REN/IFC electrically); the ONLY all-outputs release is the
+  off-bus detach at STOPPING→DRAINING, certified by an honest
+  `safe_detached` (T8-01).
 
 ### IEEE 488.2-1992 module E + controller protocols
 
@@ -211,20 +223,32 @@ CTest runs 7 targets: s1, device_smoke, 4x matrix, bigcfg).
 4. Core-to-core: two real instances exchanging TCT on one wire.
 5. **The T04 independent wire oracle** (`tests/oracle_peer.c`): a partner
    sharing ZERO protocol code with the core (own handshake, own command
-   table, waveform trace, online wire invariants). It already caught a
-   real bug invisible to every FSM-shared test (EOI-with-STB terminating
-   the poll before its epilogue, 488.2 16.2.6) and a two-talker DIO
-   window. O8 adds per-DRIVE interception (the Rev7 probe technique):
-   REN/IFC persistence is asserted on every single drive() call, not
-   just per round — the class of one-round glitches no snapshot-level
-   trace can see.
+   table, waveform trace, online wire invariants, per-DRIVE
+   interception). It has found THREE real core bugs that no FSM-shared
+   test could see:
+   - EOI asserted with the status byte terminated the serial poll before
+     its SPD/UNT epilogue (488.2 16.2.6: the controller must ignore EOI
+     on the STB);
+   - a two-talker DIO window: the oracle (source) legitimately held its
+     DIO drivers through the controller's next command byte;
+   - the lost accept pulse: the terminal-READ early return skipped the
+     AH's final drive, so the NDAC release of the LAST byte never
+     reached the wire — on hardware the talker hangs in SWNS holding
+     its data lines forever.
+   O8 asserts REN/IFC persistence on EVERY single drive() call (the
+   Rev7 probe technique — one-round glitches invisible to snapshot
+   traces); O12 verifies the electrical detach lifecycle (shutdown with
+   REN live releases at the DRAINING boundary; a port that refuses to
+   certify blocks deinit with BUSY_PORT_TEARDOWN_PENDING).
 
-**Traceability:** every audit item (F01-F26 of the 2026-10-31 IEEE review,
-T01-T16 of the test audit, R6-01..R6-04 of the Rev6 re-audit, R7-01 of
-the Rev7 re-audit, T8-01/T8-02 of the Rev8 re-audit) is either fixed with a regression test or explicitly
-deferred below. The PP1 function is verified against the §2.9 extract;
-RL/DC/DT against §5; SH/AH against the SH/AH extract; controller
-protocols against the 488.2 extract.
+**Traceability:** every audit item is either fixed with a regression
+test or explicitly deferred below — F01-F26 (IEEE review, 2026-10-31),
+T01-T16 (test audit), R6-01..R6-04 (Rev6), R7-01 (Rev7), T8-01/T8-02
+(Rev8). The PP1 function is verified against the §2.9 extract; RL/DC/DT
+against §5; SH/AH against the SH/AH extract; controller protocols
+against the 488.2 extract. The REN low-time anchoring for ports with
+pre-existing physical history is a documented port contract
+(`gpib_cfg.h`, T8_STRICT note).
 
 **Known deferred (deliberate, profile-level):** EOS terminator policy
 (OPEN-10), zero-length block policy (OPEN-23), device event
@@ -235,6 +259,15 @@ minimal module-E argument parser (u8 only, F26), hardware timings
 
 ## Not implemented (deliberate)
 
+- **REQUESTCTL composite lifecycle** (R6-04 residue): the FINDRQS
+  results live in instance memory (no stack-lifetime risk) and the
+  bounded drain cancels+drains on timeout, but the full formalization
+  (fault-injected stuck port, repeated-composite gating, ACK result
+  checking) is pending its own test pass.
+- **Independent multi-controller takeover tests**: the
+  sequencer-master/C-FSM-model split is deliberate (single-controller
+  profile); tcs/tca takeover chains and dual-controller fault injection
+  await the hardware-adjacent stage.
 - **PP IFC-reset extract pending**: the mock resets the PP groups on
   IFC (both groups to pon states); §2.9 itself specifies no IFC arc —
   that behavior belongs to the IFC section, whose extract is still
@@ -247,9 +280,13 @@ minimal module-E argument parser (u8 only, F26), hardware timings
   expose `deadline_us` (use raw `gpib_submit`); a fast
   `GPIB_TERM_NO_LISTENER` fail (vs deadline timeout) is a known
   candidate for VISA-facing adapters.
+- Per-suite CTest entries (today the 24 suites share one ctest target
+  for bisection through the suite-count argument); a `gcovr`/CI badge
+  pipeline.
 - Level-2 hardware adapters (STM32H743 / K1986VE1FI / ESP32 GPIO+IRQ
-  ports) and VT1/VT2/VT3 benches - the next stage; the line-port
-  contract is the integration surface.
+  ports; an LPT bit-bang adapter design exists in the session notes)
+  and VT1/VT2/VT3 benches - the next stage; the line-port contract is
+  the integration surface.
 - Doxygen HTML generation, C ABI freeze (all names/values remain [O]).
 
 ## Normative basis
