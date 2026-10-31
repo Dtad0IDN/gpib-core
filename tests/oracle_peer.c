@@ -238,6 +238,11 @@ static void talker_round(oracle_peer_t *p, bool atn, bool nrfd, bool ndac) {
 
 static bool o_read_lines(void *user, gpib_line_snap_t *snap) {
     oracle_peer_t *p = (oracle_peer_t *)user;
+    if (p->read_fail) {
+        /* Rev10 §7 fault injection: the port cannot sample -- the core
+         * must cope (no progress, no crash) until the port recovers. */
+        return false;
+    }
     bool atn = lvl(p, VBL_ATN);
     bool eoi = lvl(p, VBL_EOI);
     bool dav = lvl(p, VBL_DAV);
@@ -344,11 +349,35 @@ static bool o_read_lines(void *user, gpib_line_snap_t *snap) {
         }
     }
     p->dav_prev = dav;
+    p->last_dav_lvl = dav; /* ring-independent level for INV2 */
+    p->have_last_lvl = true;
     return true;
 }
 
 static void o_drive(void *user, const gpib_line_drive_t *req) {
     oracle_peer_t *p = (oracle_peer_t *)user;
+    /* Rev10 §4.3: journal EVERY drive call -- intra-round glitches
+     * (forbidden release + correct value inside one round) land here
+     * even though the per-round snapshot ring only sees the final
+     * state of the round. Gated together with the trace ring: wedged
+     * scenarios (O14) opt out of diagnostic recording, not of the
+     * online invariants. */
+    if (p->trace_enabled) {
+        if (p->dr_n < ORACLE_DRIVE_JOURNAL_MAX) {
+            oracle_drive_rec_t *r = &p->dr_journal[p->dr_n++];
+            r->atn = req->atn ? 1 : 0;
+            r->eoi = req->eoi ? 1 : 0;
+            r->dav = req->dav ? 1 : 0;
+            r->nrfd = req->nrfd ? 1 : 0;
+            r->ndac = req->ndac ? 1 : 0;
+            r->ifc = req->ifc ? 1 : 0;
+            r->ren = req->ren ? 1 : 0;
+            r->srq = req->srq ? 1 : 0;
+            r->round = (uint16_t)p->trace_len;
+        } else {
+            p->dr_overflow = true;
+        }
+    }
     /* INV (Rev6 §5.2): ATN must not flip while DAV is held -- releasing
      * BOTH in one drive is legal (end of a command phase); holding DAV
      * across an ATN change is a mid-byte phase break. */
@@ -406,8 +435,10 @@ static void o_drive_data(void *user, const uint8_t *value) {
         vbus_release_dio(p->bus, p->core_id);
         return;
     }
-    /* INV2: the source must hold DIO stable while DAV is asserted. */
-    if (p->trace_len > 0u && p->trace[p->trace_len - 1u].dav &&
+    /* INV2: the source must hold DIO stable while DAV is asserted.
+     * Rev10 §6.4: uses the ring-independent last levels, so the check
+     * survives tracing-disabled wedged scenarios. */
+    if (p->have_last_lvl && p->last_dav_lvl &&
         p->core_dio_prev != 0xFFu && *value != p->core_dio_prev) {
         p->violations++;
     }

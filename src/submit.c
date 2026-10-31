@@ -633,8 +633,16 @@ gpib_status_t gpib_requestctl_pass(gpib_context_t *ctx, const uint8_t *addrs,
                drain++ < 40000) {
             gpib_process(ctx);
         }
-        gpib_result_ack(ctx, fq_b);
-        gpib_result_ack(ctx, fq_t);
+        /* Rev10 §6.2: the ACK results are CHECKED, not ignored -- a
+         * failed ACK means the ledger slots are still held; surface it
+         * in the trace so a wedged drain is diagnosable instead of
+         * silently leaking slots until deinit. */
+        gpib_status_t ack_b = gpib_result_ack(ctx, fq_b);
+        gpib_status_t ack_t = gpib_result_ack(ctx, fq_t);
+        if (ack_b != GPIB_OK || ack_t != GPIB_OK) {
+            GPIB_TRACE(ctx, GPIB_TRC_ACCOUNT, 0xFFFFu, 0xFFFFu,
+                (uint32_t)((ack_t << 8u) | (ack_b & 0xFFu)));
+        }
         return GPIB_BUSY_RESOURCES;
     }
     /* Free the FINDRQS ledger slots: its result (found index) is already

@@ -247,7 +247,10 @@ T01-T16 (test audit), R6-01..R6-04 (Rev6), R7-01 (Rev7), T8-01/T8-02
 (Rev8), and the Rev9 recommendations (final-accept-pulse sequence test,
 REQUESTCTL stuck-port fault injection, exact teardown busy reason with
 port recovery, silent-on-green diagnostics, a dedicated oracle CTest
-target). The PP1 function is verified against the §2.9 extract; RL/DC/DT
+target, and the Rev10 findings: --suite isolation for that target, a
+per-DRIVE time-stamped journal catching intra-round output glitches
+(sensitivity proven by re-running the auditor's own mutation), and
+read_lines-failure injection). The PP1 function is verified against the §2.9 extract; RL/DC/DT
 against §5; SH/AH against the SH/AH extract; controller protocols
 against the 488.2 extract. The REN low-time anchoring for ports with
 pre-existing physical history is a documented port contract

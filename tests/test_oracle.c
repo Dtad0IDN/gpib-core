@@ -15,15 +15,19 @@ static uint8_t s_tx[64];
 static uint8_t s_reply[24];
 static uint8_t s_rx_buf[64];
 
-/* Rev7 §5.4: one clean-exit gate for every oracle scenario. */
+/* Rev7 §5.4 / Rev10 §6.5: one clean-exit gate for every oracle
+ * scenario. The near-limit print is diagnostics ONLY (the overflow
+ * flag itself is the test condition). */
 static void oracle_assert_clean(const oracle_peer_t *p) {
-    if (p->violations != 0u || p->trace_overflow || p->trace_len > 1900u) {
-        fprintf(stderr, "[clean] viol=%u atn=%u confl=%u len=%zu ovf=%d\n",
-            p->violations, p->viol_atn, p->viol_conflict,
-            (size_t)p->trace_len, (int)p->trace_overflow);
+    if (p->violations != 0u || p->trace_overflow || p->dr_overflow) {
+        fprintf(stderr, "[clean] viol=%u atn=%u confl=%u len=%zu ovf=%d "
+            "dr_ovf=%d\n", p->violations, p->viol_atn, p->viol_conflict,
+            (size_t)p->trace_len, (int)p->trace_overflow,
+            (int)p->dr_overflow);
     }
     CHECK(p->violations == 0);
     CHECK(!p->trace_overflow);
+    CHECK(!p->dr_overflow);
 }
 
 static void o_fill(void) {
@@ -787,19 +791,34 @@ static void oracle_o13_final_ack_sequence(void) {
             }
         }
         REQUIRE(found);
-        /* (3) stop state from the round after the acknowledgement. */
-        bool transition_allowed = true;
+        /* (3) stop state from the round after the acknowledgement.
+         * Rev10 §6.3: NO new DAV may appear after the terminal byte
+         * (the source is done; the controller never sources here). */
         for (size_t i = held + 2u; i < peer.trace_len; i++) {
-            if (peer.trace[i].dav) {
-                transition_allowed = true;
-                continue;
-            }
+            CHECK(!peer.trace[i].dav);
             CHECK(peer.trace[i].nrfd == 1u);
-            if (transition_allowed) {
-                transition_allowed = false;
-            } else {
-                CHECK(peer.trace[i].ndac == 1u);
+            CHECK(peer.trace[i].ndac == 1u);
+        }
+        /* (4) Rev10 §4.3: the per-DRIVE journal, TIME-STAMPED with the
+         * snapshot round: every drive issued from the acknowledgement
+         * round (held+1) onward -- until a control sequence (atn)
+         * legitimately ends the stop state -- must keep the handshake
+         * held. Anchoring on the ROUND (not on "the last pulse entry")
+         * is what catches the auditor's mutation: a forbidden release
+         * followed by the correct pulse INSIDE the same round. */
+        {
+            uint16_t from_round = (uint16_t)(held + 1u);
+            for (size_t i = 0; i < peer.dr_n; i++) {
+                const oracle_drive_rec_t *jr = &peer.dr_journal[i];
+                if (jr->round < from_round) {
+                    continue;
+                }
+                if (jr->atn) {
+                    break; /* next control sequence: stop state ends */
+                }
+                CHECK(jr->nrfd || jr->ndac); /* never fully released */
             }
+            CHECK(peer.dr_overflow == false);
         }
     }
     CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
@@ -852,6 +871,13 @@ static void oracle_o14_requestctl_stuck(void) {
           GPIB_BUSY_RESOURCES); /* bounded failure, no hang */
     peer.freeze_clock = false;
     peer.trace_enabled = true;
+    /* Rev10 §7 (the auditor's external probe, now in CI): a port whose
+     * read_lines FAILS outright (not just slow) -- the composite must
+     * still bound, and after the port recovers the lifecycle completes. */
+    peer.read_fail = true;
+    CHECK(gpib_requestctl_pass(&ctx, addrs, 1, &found, &t, &b) ==
+          GPIB_BUSY_RESOURCES);
+    peer.read_fail = false;
     /* The instance is still usable: the drain recovered, shutdown and
      * deinit complete normally once the clock runs again. */
     CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
