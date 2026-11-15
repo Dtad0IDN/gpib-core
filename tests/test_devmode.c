@@ -5,6 +5,7 @@
 #include "gpib/gpib_storage.h"
 #include "mock_ctrl.h"
 #include "test_util.h"
+#include "vbus.h"
 
 /* Device-role E2E: the core (device at address 5) exchanges with a
  * simulated external controller on the wired-OR vbus.
@@ -154,7 +155,7 @@ static void dv_04_module_e(void) {
     CHECK(memcmp(s_sink, prog, sizeof(prog) - 1u) == 0);
     /* Feed the received message into module E and push STB/rsv to core. */
     CHECK(gpib_4882_feed(&mod, (const char *)s_sink, res.bytes_confirmed));
-    CHECK(mod.esr == 0x01u); /* OPC bit (ESE 1 enables it) */
+    CHECK(mod.esr == 0x81u); /* PON (init) + OPC bit (ESE 1 enables it) */
     CHECK(mod.ese == 0x01u);
     CHECK(mod.sre == 0x20u); /* ESB enabled for service requests */
     CHECK(mod.stb == 0x20u);
@@ -251,12 +252,96 @@ static void dv_05_df_overflow_fault(void) {
     CHECK(gpib_deinit(&ctx) == GPIB_OK);
 }
 
+/* DV-D01 (final audit, probe-H scenario): a controller that ABORTS the
+ * serial poll mid-STB (asserts ATN without accepting the byte -- the
+ * routine timeout path with a hung instrument) and then reads data must
+ * receive the DATA FIRST. The old code kept the spas_tx_active latch
+ * alive: the stale STB was later injected as the FIRST data byte
+ * (0x62 'D' 'A' 'T' 'A' '!' instead of "DATA!"), and without a repeat
+ * poll the supply could never even start. */
+static void dv_d01_spas_abort(void) {
+    GPIB_CONTEXT_STORAGE_DEFINE(ctx);
+    mock_ctrl_port_t port;
+    gpib_handle_t t = { 0, 0, 0, 0, 0 };
+    gpib_handle_t b = { 0, 0, 0, 0, 0 };
+    gpib_result_t res;
+    int guard = 0;
+    fill();
+    start_dev(&ctx, &port);
+    CHECK(gpib_device_set_stb(&ctx, 0x22u) == GPIB_OK);
+    CHECK(gpib_device_service_request(&ctx, true) == GPIB_OK);
+    /* Arm the poll: SPE, then address us as talker. */
+    {
+        uint8_t spe = 0x18u;
+        mock_ctrl_cmds(&port, &spe, 1);
+    }
+    guard = 0;
+    while (ctx.line.tk.sp != GPIB_T_SPMS && guard++ < 2000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    REQUIRE(guard < 2000);
+    mock_ctrl_read(&port, 5, 1);
+    /* Run until the core raises DAV with the STB (the latch arms when
+     * SPAS is reached with ATN released -- the mock's own addressing
+     * also raises DAV, so wait on the latch itself). */
+    guard = 0;
+    while (!ctx.spas_tx_active && guard++ < 20000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    REQUIRE(guard < 20000);
+    REQUIRE(ctx.spas_tx_active); /* mid-STB: the latch is set */
+    /* ABORT the poll: a THIRD participant steals ATN without the byte
+     * being accepted (the mock's own model stays coherent). */
+    vbus_attach_as(&port.c.bus, 2);
+    vbus_assert(&port.c.bus, 2, VBL_ATN);
+    guard = 0;
+    while (ctx.spas_tx_active && guard++ < 20000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    REQUIRE(guard < 20000); /* D01: the latch DIED with the abort */
+    vbus_release(&port.c.bus, 2, VBL_ATN);
+    /* Close the poll properly: SPD (the mock drives ATN itself). */
+    {
+        uint8_t spd = 0x19u;
+        mock_ctrl_cmds(&port, &spd, 1);
+    }
+    guard = 0;
+    while (ctx.line.tk.sp != GPIB_T_SPIS && guard++ < 20000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    REQUIRE(guard < 20000);
+    /* The controller reads data: the supply must deliver 'D' first. */
+    CHECK(gpib_device_supply(&ctx, (const uint8_t *)"DATA!", 5, &t, &b) ==
+          GPIB_OK);
+    mock_ctrl_read(&port, 5, 5);
+    guard = 0;
+    while ((!port.c.done || gpib_result_peek(&ctx, t, &res) != GPIB_OK) &&
+           guard++ < 20000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    REQUIRE(guard < 20000);
+    REQUIRE(port.c.rx_len == 5u); /* exactly DATA!, no phantom STB */
+    CHECK(port.c.rx[0] == (uint8_t)'D');
+    CHECK(port.c.rx[1] == (uint8_t)'A');
+    CHECK(port.c.rx[2] == (uint8_t)'T');
+    CHECK(port.c.rx[3] == (uint8_t)'A');
+    CHECK(port.c.rx[4] == (uint8_t)'!');
+    CHECK(res.reason == GPIB_TERM_COMPLETED);
+    CHECK(res.bytes_confirmed == 5);
+    CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
+    CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
+    CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
+    CHECK(gpib_process(&ctx) == GPIB_OK);
+    CHECK(gpib_deinit(&ctx) == GPIB_OK);
+}
+
 void suite_devmode(void) {
     dv_01_supply();
     dv_02_sink();
     dv_03_service_channel();
     dv_04_module_e();
     dv_05_df_overflow_fault();
+    dv_d01_spas_abort();
 }
 
 #else /* controller build: negative surface only */

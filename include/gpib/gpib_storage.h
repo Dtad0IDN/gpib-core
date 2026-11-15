@@ -28,7 +28,12 @@
      ((uint32_t)(GPIB_CFG_MAX_OPERATIONS) * 0x85EBCA6Bu) ^ \
      ((uint32_t)(GPIB_CFG_MAX_BLOCKS) * 0xC2B2AE35u) ^ \
      ((uint32_t)(GPIB_CFG_TRACE_EVENTS) * 0x27D4EB2Fu) ^ \
-     ((uint32_t)(GPIB_CFG_DEVICE_EVENTS) * 0x165667B1u))
+     ((uint32_t)(GPIB_CFG_DEVICE_EVENTS) * 0x165667B1u) ^ \
+     ((uint32_t)(GPIB_CFG_MAX_CMDS) * 0x9E3779B1u) ^ \
+     ((uint32_t)(GPIB_CFG_MAX_LISTENERS) * 0x85EBCA6Du) ^ \
+     ((uint32_t)(GPIB_CFG_DF_EVENTS) * 0x27D4EB31u) ^ \
+     ((uint32_t)(GPIB_CFG_PROCESS_BUDGET) * 0x165667B5u) ^ \
+     ((uint32_t)sizeof(struct gpib_context)))
 
 typedef enum gpib_txn_state {
     TXN_UNRESERVED = 0,
@@ -50,13 +55,18 @@ typedef enum gpib_block_state {
 
 typedef struct gpib_txn_record {
     gpib_txn_state_t state;
-    uint16_t generation; /* bumped on ACK; 0 = never used */
+    uint32_t generation; /* H6: 32-bit (bumped on ACK; 0 = never used) */
     gpib_address_t address;
     const gpib_address_t *listeners_first; /* WRITE_MANY list (borrowed) */
     size_t listener_count;
     gpib_request_kind_t kind;
     size_t block_count;
     size_t blocks_terminal;
+    /* R17-01: per-transaction FIFO sequence for block dispatch. The
+     * physical block-slot index must NEVER define transfer order: an
+     * ACK frees a low slot mid-stream and a later submit_block reuses
+     * it -- dispatching by slot reordered A B C D into A B D C. */
+    uint32_t next_block_seq;
     size_t rx_limit;       /* READ stream target (rx_min_bytes), 0 = EOI only */
     size_t stream_bytes;   /* cross-block confirmed byte accumulation */
     uint64_t deadline_us;  /* absolute logical deadline, 0 = none ([P]) */
@@ -85,6 +95,7 @@ typedef struct gpib_txn_record {
     size_t probe_index;
     uint8_t probe_state; /* 0=send MLA, 1=observe NDAC */
     uint8_t ppr_byte;    /* PPOLL: the read PPR result */
+    bool retired;        /* R17-02: generation exhausted; slot retired */
     /* RESET: the staged *RST message for the current target. */
     uint8_t rst_msg[6];
     gpib_result_t result;  /* valid in TXN_RESULT_READY */
@@ -92,17 +103,25 @@ typedef struct gpib_txn_record {
 
 typedef struct gpib_block_record {
     gpib_block_state_t state;
-    uint16_t generation;
+    uint32_t generation; /* H6 */
     /* Correlation only, deliberately no live reference into the transaction
      * ledger: transaction slot reuse cannot corrupt this record (FIX-01,
      * REQ-077). */
     uint16_t txn_slot;
-    uint16_t txn_generation;
+    uint32_t txn_generation; /* H6 */
+    uint32_t txn_seq; /* R17-01: submit-order sequence within the txn:
+                       * dispatch picks the LOWEST seq among queued
+                       * blocks, independent of the physical slot. */
     /* Borrowed zero-copy payload, valid until the block's own ACK. */
     const uint8_t *data;
     size_t len;
     bool is_rx;         /* RX blocks expose a read-only view before ACK */
     bool quarantined;   /* undemostrable quiescence: pinned forever (LED-04) */
+    bool retired;       /* R17-02: generation exhausted; never reused */
+    uint8_t internal_payload; /* AUD-16: block-OWNED one-byte storage for
+                               * SPOLL STB / PPOLL PPR / FINDRQS STB --
+                               * the view must stay valid until THIS
+                               * block's ACK, surviving txn slot reuse. */
     gpib_result_t result; /* valid in BLOCK_RESULT_READY */
 } gpib_block_record_t;
 
@@ -112,9 +131,13 @@ typedef struct gpib_block_record {
 struct gpib_action {
     uint8_t state; /* gpib_action_state_t */
     uint8_t kind;  /* gpib_action_kind_t */
-    uint16_t generation; /* bumped per publish, starts at 1 */
+    uint16_t generation; /* bumped per publish, starts at 1. DELIBERATELY
+                          * 16-bit (N12-01 audit): it pairs with the
+                          * 16-bit port event tag (F20 port contract);
+                          * the HANDLE/ledger identity path is the full
+                          * 32-bit generation. */
     uint16_t block_slot;
-    uint16_t block_generation;
+    uint32_t block_generation; /* H6 */
     uint16_t txn_slot;
     const uint8_t *data;
     size_t len;      /* buffer capacity */
@@ -201,17 +224,28 @@ struct gpib_context {
                            * addressing stays latched, the acceptor holds
                            * NRFD (backpressure), and the next block
                            * resumes DATA_RX with NO new prologue. */
+    uint16_t rx_session_slot; /* C5: the session belongs to EXACTLY this
+                               * transaction (slot + generation): another
+                               * READ (or a cancelled one) must never
+                               * resume a stranger's stream. */
+    uint32_t rx_session_gen; /* N12-01: MUST match the 32-bit txn
+                              * generation width -- a 16-bit copy used
+                              * to truncate past 65 535 and the
+                              * scheduler disowned its own stream
+                              * (permanent stall, rev12 probe). */
     bool pp_drove_dio; /* device PP1 (F04): WE own the DIO drivers this
                         * round for the PPR answer -- release when the
                         * PPAS window closes. */
+    uint64_t probe_settle_deadline; /* FINDLSTN 17.6.5: end of the
+                                     * >= 1.5 ms ATN-false window */
     bool sc_ren;
-        bool cic_once; /* has EVER held CIC (power-on IFC or TCT) */
-        uint8_t idy_rounds; /* PPOLL: IDY settle counter */
+    bool cic_once; /* has EVER held CIC (power-on IFC or TCT) */
+    uint32_t idy_rounds; /* AUD-14 runaway cap (time is the real bound) */
+    uint64_t idy_start_us; /* AUD-14: physical IDY start (T6 by time) */
     } line;
 /* Device service-event ring: raw command bytes, oldest-dropped policy
- * with a loss counter; interpretation is the application's until the
- * normative baseline arrives (REQ-016, OPEN-01/02). */
-#define GPIB_CFG_DF_EVENTS 8
+  * with a loss counter; interpretation is the application's until the
+     * normative baseline arrives (REQ-016, OPEN-01/02). */
 #ifndef GPIB_CFG_DF_EVENTS
 #define GPIB_CFG_DF_EVENTS 8
 #endif

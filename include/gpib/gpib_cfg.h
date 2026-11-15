@@ -63,12 +63,13 @@
 #ifndef GPIB_CFG_PROBE_TIMEOUT_US
 #define GPIB_CFG_PROBE_TIMEOUT_US 50u
 #endif
-/* PARALLEL POLL IDY settle, in bus exchange rounds (T6 approximation).
- * Must exceed one gpib_process budget so that a SEPARATE core instance
- * (dual-core tests, real multi-controller setups) gets a processing
- * slice inside the IDY window and its PPR drive lands before the read. */
-#ifndef GPIB_CFG_IDY_SETTLE_ROUNDS
-#define GPIB_CFG_IDY_SETTLE_ROUNDS 12u
+/* PARALLEL POLL IDY settle (T6): a TIME bound per Table 39 (>= 2 us),
+ * measured from the physical IDY start on the port clock (AUD-14). A
+ * second core instance sharing the bus gets a real processing slice
+ * inside the window; a frozen clock stalls the poll instead of
+ * fabricating a result. */
+#ifndef GPIB_CFG_T6_SETTLE_US
+#define GPIB_CFG_T6_SETTLE_US 12u
 #endif
 /* IFC pulse length and REN low-time (T8 family): the standard demands
  * STRICTLY MORE than 100 us (488.1 3.3 / 488.2 16.2.11, NAT4882 sre),
@@ -82,6 +83,19 @@
  * its own last-release edge and is allowed to delay the first sre. */
 #ifndef GPIB_CFG_T8_STRICT_US
 #define GPIB_CFG_T8_STRICT_US 101u
+#endif
+
+/* FINDLSTN settle window (488.2 17.6.5): with ATN FALSE the controller
+ * waits at least 1.5 ms before sampling NDAC. Simulated microseconds
+ * (one bus round = one us in the host model); real ports re-anchor to
+ * their own clock. Compile-time conformant floor (rev14 T14-02): a
+ * build with a shorter window is NOT a 488.2 FINDLSTN -- refuse it
+ * unless this guard is deliberately edited for a mutation lab. */
+#ifndef GPIB_CFG_FINDLSTN_SETTLE_US
+#define GPIB_CFG_FINDLSTN_SETTLE_US 1500u
+#endif
+#if GPIB_CFG_FINDLSTN_SETTLE_US < 1500u
+#error "GPIB_CFG_FINDLSTN_SETTLE_US < 1500 us violates 488.2 17.6.5"
 #endif
 
 #endif /* GPIB_CFG_H */

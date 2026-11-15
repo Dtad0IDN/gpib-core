@@ -3,6 +3,7 @@
 #include "gpib/gpib.h"
 #include "gpib/gpib_port.h"
 #include "gpib/gpib_storage.h"
+#include "mock_port.h"
 #include "test_util.h"
 
 static const uint8_t s_payload[4] = { 1, 2, 3, 4 };
@@ -164,10 +165,150 @@ static void txn_05(void) {
     CHECK(t_new.epoch != t_old.epoch);
 }
 
+/* TXN-06 (R17-01): block dispatch order is the SUBMIT order, not the
+ * physical slot. The auditor's sequence: submit A, block B, block C;
+ * ACK A while B executes (slot 0 freed); submit D (takes slot 0) --
+ * the wire order must stay A B C D, the slot-based picker produced
+ * A B D C. */
+static void txn_06(void) {
+    GPIB_CONTEXT_STORAGE_DEFINE(ctx);
+    mock_port_t m;
+    gpib_init_params_t p;
+    gpib_request_t r;
+    gpib_handle_t t = { 0, 0, 0, 0, 0 };
+    gpib_handle_t ba = { 0, 0, 0, 0, 0 };
+    gpib_handle_t bb = { 0, 0, 0, 0, 0 };
+    gpib_handle_t bc = { 0, 0, 0, 0, 0 };
+    gpib_handle_t bd = { 0, 0, 0, 0, 0 };
+    gpib_result_t res;
+    static uint8_t blk[4][8];
+    int guard = 0;
+    init_params_fill(&p, 5);
+    mock_init(&m);
+    p.port = &m.base;
+    CHECK(gpib_init(&ctx, &p) == GPIB_OK);
+    CHECK(gpib_start(&ctx) == GPIB_OK);
+    for (int i = 0; i < 4; i++) {
+        memset(blk[i], (uint8_t)('A' + i), sizeof(blk[i]));
+    }
+    m.bytes_per_transfer = 1; /* one byte per round: slack to ACK and
+                                * re-submit while B is still executing */
+    memset(&r, 0, sizeof(r));
+    r.kind = GPIB_REQ_WRITE;
+    r.address.primary = 6;
+    r.tx_data = blk[0];
+    r.tx_len = 8;
+    CHECK(gpib_submit(&ctx, &r, &t, &ba) == GPIB_OK);
+    CHECK(gpib_submit_block(&ctx, t, blk[1], 8, &bb) == GPIB_OK);
+    CHECK(gpib_submit_block(&ctx, t, blk[2], 8, &bc) == GPIB_OK);
+    /* Let A complete and B start, then free A's slot mid-flight. */
+    while (gpib_result_peek(&ctx, ba, &res) != GPIB_OK && guard++ < 20000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    REQUIRE(guard < 20000);
+    CHECK(gpib_result_ack(&ctx, ba) == GPIB_OK); /* frees slot 0 */
+    /* D reuses the freed LOW slot; its SUBMIT order is last. */
+    CHECK(gpib_submit_block(&ctx, t, blk[3], 8, &bd) == GPIB_OK);
+    CHECK(ctx.block[bd.slot].txn_slot == ba.slot); /* D indeed took the
+                                                    * recycled low slot */
+    guard = 0;
+    while (gpib_result_peek(&ctx, t, &res) != GPIB_OK && guard++ < 20000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    REQUIRE(guard < 20000);
+    CHECK(res.reason == GPIB_TERM_COMPLETED);
+    CHECK(res.bytes_confirmed == 32u);
+    /* The mock byte-pump journal must be A B C D in order. */
+    CHECK(m.journal_len == 32u);
+    for (size_t i = 0; i < m.journal_len; i++) {
+        CHECK(m.journal[i] == (uint8_t)('A' + (i / 8u)));
+    }
+    CHECK(gpib_result_ack(&ctx, bd) == GPIB_OK);
+    CHECK(gpib_result_ack(&ctx, bc) == GPIB_OK);
+    CHECK(gpib_result_ack(&ctx, bb) == GPIB_OK);
+    CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
+    CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
+    CHECK(gpib_process(&ctx) == GPIB_OK);
+    CHECK(gpib_deinit(&ctx) == GPIB_OK);
+}
+
+/* TXN-07 (R17-02): at generation exhaustion the slot RETIRES -- a
+ * wrapped generation can never re-validate a stale handle. */
+static void txn_07(void) {
+    GPIB_CONTEXT_STORAGE_DEFINE(ctx);
+    mock_port_t m;
+    gpib_init_params_t p;
+    gpib_request_t r = make_write(6);
+    gpib_handle_t t = { 0, 0, 0, 0, 0 };
+    gpib_handle_t b = { 0, 0, 0, 0, 0 };
+    init_params_fill(&p, 5);
+    mock_init(&m);
+    m.bytes_per_transfer = 4;
+    p.port = &m.base;
+    CHECK(gpib_init(&ctx, &p) == GPIB_OK);
+    CHECK(gpib_start(&ctx) == GPIB_OK);
+    CHECK(gpib_submit(&ctx, &r, &t, &b) == GPIB_OK);
+    /* White-box acceleration (the auditor's probe): place the block
+     * generation AT the wrap boundary -- BOTH the record and the local
+     * handle copy stay in sync (handles are values). The next ACK hits
+     * the retirement branch. */
+    ctx.block[b.slot].generation = UINT32_MAX;
+    b.generation = UINT32_MAX;
+    {
+        int guard = 0;
+        gpib_result_t res;
+        while (gpib_result_peek(&ctx, b, &res) != GPIB_OK &&
+               guard++ < 20000) {
+            CHECK(gpib_process(&ctx) == GPIB_OK);
+        }
+        REQUIRE(guard < 20000);
+    }
+    /* The boundary ACK: generation would wrap -- the slot retires. */
+    CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
+    CHECK(ctx.block[b.slot].retired);
+    /* The single-block WRITE is already terminal: peek + ack the txn. */
+    {
+        gpib_result_t res;
+        CHECK(gpib_result_peek(&ctx, t, &res) == GPIB_OK);
+    }
+    CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
+    /* A fresh submit NEVER lands in the retired slot. */
+    {
+        gpib_handle_t t2 = { 0, 0, 0, 0, 0 };
+        gpib_handle_t b2 = { 0, 0, 0, 0, 0 };
+        CHECK(gpib_submit(&ctx, &r, &t2, &b2) == GPIB_OK);
+        CHECK(b2.slot != b.slot);
+        CHECK(gpib_request_cancel(&ctx, t2) == GPIB_OK);
+        {
+            gpib_result_t res;
+            int guard = 0;
+            while (gpib_result_peek(&ctx, t2, &res) != GPIB_OK &&
+                   guard++ < 20000) {
+                CHECK(gpib_process(&ctx) == GPIB_OK);
+            }
+            REQUIRE(guard < 20000);
+        }
+        CHECK(gpib_result_ack(&ctx, b2) == GPIB_OK);
+        CHECK(gpib_result_ack(&ctx, t2) == GPIB_OK);
+    }
+    CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
+    {
+        int guard = 0;
+        while (ctx.lifecycle != (uint8_t)GPIB_LC_DRAINING &&
+               guard++ < 20000) {
+            CHECK(gpib_process(&ctx) == GPIB_OK);
+        }
+        REQUIRE(guard < 20000);
+    }
+    CHECK(gpib_deinit(&ctx) == GPIB_OK);
+}
+
 void suite_txn(void) {
     txn_01();
     txn_02();
     txn_03();
     txn_04();
     txn_05();
+    txn_06();
+    txn_07();
 }

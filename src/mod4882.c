@@ -40,9 +40,12 @@ static void resp_begin(gpib_4882_t *m) {
         /* F24 (488.2 6.3): a previous query response was never read --
          * starting a new program message destroys it: Query Error. */
         m->esr |= ESR_QYE;
-        stb_recompute(m);
     }
     m->resp_len = 0;
+    /* A14: MAV must reflect the queue AFTER the clear -- the old code
+     * recomputed before wiping resp_len, leaving MAV/RSV asserted about
+     * a response that no longer exists. */
+    stb_recompute(m);
 }
 
 static void resp_sep(gpib_4882_t *m) {
@@ -134,6 +137,25 @@ static bool parse_u8(const char *s, size_t len, uint8_t *out) {
  * on NL; we split each line on ';' and execute every unit in order. */
 static void exec_unit(gpib_4882_t *m, const char *unit, size_t len);
 
+/* 488.2 7.6: common-command mnemonics are case-INsensitive
+ * ("*idn?" == "*IDN?"). Four ASCII letters, upper-cased pairwise. */
+static bool ci4(const char *a, const char *b) {
+    for (int i = 0; i < 4; i++) {
+        char x = a[i];
+        char y = b[i];
+        if (x >= 'a' && x <= 'z') {
+            x = (char)(x - 'a' + 'A');
+        }
+        if (y >= 'a' && y <= 'z') {
+            y = (char)(y - 'a' + 'A');
+        }
+        if (x != y) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void exec_line(gpib_4882_t *m, const char *line, size_t len) {
     resp_begin(m); /* one response message per program message line */
     m->resp_overflow = false; /* QYE is per-message (488.2 6.3.2) */
@@ -192,38 +214,65 @@ static void exec_unit(gpib_4882_t *m, const char *unit, size_t len) {
         stb_recompute(m);
         return;
     }
-    if (memcmp(mn, "*CLS", 4u) == 0u && !is_query && alen == 0u) {
+    if (ci4(mn, "*CLS") && !is_query && alen == 0u) {
         m->esr = 0;
         m->resp_len = 0;
         stb_recompute(m);
         return;
     }
-    if (memcmp(mn, "*ESE", 4u) == 0u) {
+    if (ci4(mn, "*ESE")) {
+        /* AUD-19: an argument is MANDATORY for the program form: a bare
+         * "*ESE" used to assign zero and silently clear the mask. */
         if (is_query) {
+            if (alen != 0u) {
+                m->esr |= ESR_CME; /* query takes no argument */
+                stb_recompute(m);
+                return;
+            }
             resp_unit_begin(m);
             resp_u8(m, m->ese);
             stb_recompute(m);
         } else {
+            if (alen == 0u) {
+                m->esr |= ESR_CME;
+                stb_recompute(m);
+                return;
+            }
             m->ese = arg;
             stb_recompute(m); /* enabling bits can raise MSS */
         }
         return;
     }
-    if (memcmp(mn, "*ESR", 4u) == 0u && is_query) {
+    if (ci4(mn, "*ESR") && is_query) {
+        if (alen != 0u) {
+            m->esr |= ESR_CME; /* D06 */
+            stb_recompute(m);
+            return;
+        }
         resp_unit_begin(m);
         resp_u8(m, m->esr);
         m->esr = 0; /* read-and-clear */
         stb_recompute(m);
         return;
     }
-    if (memcmp(mn, "*IDN", 4u) == 0u && is_query) {
+    if (ci4(mn, "*IDN") && is_query) {
+        if (alen != 0u) {
+            m->esr |= ESR_CME; /* D06 */
+            stb_recompute(m);
+            return;
+        }
         resp_unit_begin(m);
         resp_str(m, m->idn);
         stb_recompute(m);
         return;
     }
-    if (memcmp(mn, "*OPC", 4u) == 0u) {
+    if (ci4(mn, "*OPC")) {
         if (is_query) {
+            if (alen != 0u) {
+                m->esr |= ESR_CME; /* D06 */
+                stb_recompute(m);
+                return;
+            }
             /* *OPC?: with no pending operations the answer is ready ---
              * place '1' in the output queue immediately (--12.5.3). */
             resp_unit_begin(m);
@@ -235,33 +284,53 @@ static void exec_unit(gpib_4882_t *m, const char *unit, size_t len) {
         }
         return;
     }
-    if (memcmp(mn, "*SRE", 4u) == 0u) {
+    if (ci4(mn, "*SRE")) {
         if (is_query) {
+            if (alen != 0u) {
+                m->esr |= ESR_CME; /* D06 */
+                stb_recompute(m);
+                return;
+            }
             resp_unit_begin(m);
             resp_u8(m, m->sre);
             stb_recompute(m);
         } else {
+            if (alen == 0u) {
+                m->esr |= ESR_CME;
+                stb_recompute(m);
+                return;
+            }
             m->sre = (uint8_t)(arg & 0xBFu); /* SRE.6 is unused: 0 */
             stb_recompute(m); /* enabling/disabling bits changes MSS */
         }
         return;
     }
-    if (memcmp(mn, "*STB", 4u) == 0u && is_query) {
+    if (ci4(mn, "*STB") && is_query) {
+        if (alen != 0u) {
+            m->esr |= ESR_CME; /* D06 */
+            stb_recompute(m);
+            return;
+        }
         resp_unit_begin(m);
         resp_u8(m, (uint8_t)(m->stb | (m->rsv ? 0x40u : 0x00u)));
         stb_recompute(m);
         return;
     }
-    if (memcmp(mn, "*TST", 4u) == 0u && is_query) {
+    if (ci4(mn, "*TST") && is_query) {
+        if (alen != 0u) {
+            m->esr |= ESR_CME; /* D06 */
+            stb_recompute(m);
+            return;
+        }
         resp_unit_begin(m);
         resp_str(m, "0");
         stb_recompute(m);
         return;
     }
-    if (memcmp(mn, "*WAI", 4u) == 0u && !is_query) {
+    if (ci4(mn, "*WAI") && !is_query) {
         return; /* single-threaded execution model: nothing to wait for */
     }
-    if (memcmp(mn, "*RST", 4u) == 0u && !is_query) {
+    if (ci4(mn, "*RST") && !is_query) {
         /* F22 (488.2 10.14): *RST returns the DEVICE-DEPENDENT functions
          * to a known state -- it is NOT *CLS: the event register and the
          * pending response message are untouched. This helper has no
@@ -278,11 +347,13 @@ bool gpib_4882_feed(gpib_4882_t *m, const char *bytes, size_t n) {
     for (size_t k = 0; k < n; k++) {
         if (bytes[k] == '\n') {
             /* F23 (488.2 7.5): <NL> is THE universal <PMT>. */
-            if (m->line_len > 0u) {
+            if (m->line_len > 0u && !m->line_suppressed) {
                 exec_line(m, m->line_buf, m->line_len);
                 m->line_len = 0;
                 executed = true;
             }
+            m->line_len = 0;
+            m->line_suppressed = false; /* a new line starts clean */
             continue;
         }
         if (bytes[k] == '\r') {
@@ -290,10 +361,16 @@ bool gpib_4882_feed(gpib_4882_t *m, const char *bytes, size_t n) {
              * blank it never becomes part of a token. */
             continue;
         }
+        if (m->line_suppressed) {
+            continue; /* the tail of an overflowed line is DISCARDED,
+                       * never executed as a fresh command (final audit:
+                       * "100x'A';*ESE 32;*OPC" used to run its tail) */
+        }
         if (m->line_len + 1u < sizeof(m->line_buf)) {
             m->line_buf[m->line_len++] = bytes[k];
         } else {
-            m->line_len = 0; /* overflow: drop the line, command error */
+            m->line_len = 0;
+            m->line_suppressed = true; /* drop the WHOLE line incl. tail */
             m->esr |= ESR_CME;
             stb_recompute(m);
         }
@@ -305,12 +382,19 @@ bool gpib_4882_feed_end(gpib_4882_t *m) {
     /* F23 (488.2 7.5): ^END received after the last <DAB> with no <NL>
      * -- a legal <PMT> variant ("NL^END" is handled by feed itself).
      * The integration layer calls this when EOI is observed on the
-     * final byte of the program message. */
-    if (m->line_len > 0u) {
+     * final byte of the program message. AUD-18: END terminates the
+     * message exactly like NL -- a suppressed (overflowed) line is
+     * dropped and the suppression CLEARED, so the NEXT EOI-only
+     * message is parsed (a device answering NL-less clients used to
+     * go permanently silent after one overflow). */
+    if (m->line_len > 0u && !m->line_suppressed) {
         exec_line(m, m->line_buf, m->line_len);
         m->line_len = 0;
+        m->line_suppressed = false;
         return true;
     }
+    m->line_len = 0;
+    m->line_suppressed = false;
     return false;
 }
 
@@ -322,6 +406,9 @@ void gpib_4882_init(gpib_4882_t *m, const char *idn) {
         i++;
     }
     m->idn[i] = '\0';
+    /* 488.2 12.2: Power-On sets the PON event bit -- the status model
+     * starts with a reportable event (final audit: PON was missing). */
+    m->esr |= ESR_PON;
     stb_recompute(m);
 }
 

@@ -18,8 +18,16 @@ extern "C" {
  *
  * Semantic names only: the final C ABI, struct layouts and numeric codes
  * remain open ([O] OPEN-05/26). All functions are non-blocking, never
- * allocate, and run on the single protocol-owner context (REQ-021); the
- * ISR-safe subset is emergency stop and the port evidence path only.
+ * allocate, and run on the single protocol-owner context (REQ-021).
+ *
+ * THREAD/ISR CONTRACT (D02, independent audit): gpib_emergency_stop is
+ * NOT ISR-safe to call concurrently with gpib_process -- it writes
+ * multi-field state (stop latch, lifecycle, trace) without atomics, and
+ * the port contract G1 requires one total order over all core calls.
+ * From an ISR only the PORT layer is legal: port->emergency_inhibit
+ * (electric release) plus pushing a port event into the port's own
+ * queue; the owner thread observes both through gpib_process. Any other
+ * integration must externally serialize all core entry points.
  */
 
 /* Opaque instance context; the typed storage object for static placement is
@@ -290,14 +298,15 @@ gpib_status_t gpib_ppoll_unconfigure(gpib_context_t *ctx,
     gpib_handle_t *txn_out, gpib_handle_t *block_out);
 
 /**
- * Controller: FINDLSTN (488.2 §17.6, optional) - per candidate address:
- * UNL + MLA(addr) with ATN, then ONE probe DAB byte with ATN released.
- * A listener at that address is in LADS: its acceptor holds NDAC and
- * the byte handshakes (present). Nobody addressed: every acceptor
- * returns to AIDS with passive lines and the source handshake stalls
- * until the probe timeout (absent). Results: `results[i]` = true if a
- * listener was found at addrs[i]. The probe byte is received by a
- * present listener (488.2 warns FINDLSTN may disturb devices).
+ * Controller: FINDLSTN (488.2 §17.6.5, optional) - per candidate
+ * address: UNL + MLA(addr) with ATN, then ATN released for at least
+ * 1.5 ms, then the wired-OR NDAC level is sampled: an addressed
+ * listener's acceptor holds NDAC (present); nobody addressed leaves
+ * every acceptor in AIDS with passive lines (absent). NO data byte is
+ * ever transferred: the controller never drives DIO during the sweep,
+ * so a talker with a pending response on the bus cannot collide with
+ * it. Results: `results[i]` = true if a listener was found at
+ * addrs[i].
  *
  * PROFILE NOTE (F19, deliberate): the list operations (allspoll,
  * findrqs, reset, findlstn, pass_control, requestctl_pass) address
@@ -319,13 +328,16 @@ gpib_status_t gpib_findlstn(gpib_context_t *ctx, const uint8_t *addrs,
 gpib_status_t gpib_request_control(gpib_context_t *ctx);
 
 /**
- * Controller (CIC side of REQUESTCTL): serial poll the address list to
- * find the requesting controller (RQS set), then pass control to it
- * via TCT. Returns the found index in `*found` on success, (size_t)-1
- * if nobody requests. BLOCKING composite: pumps the instance until the
- * internal FINDRQS completes; the trailing TCT action is asynchronous
- * and owned by the caller via txn_out/block_out (ack both when done).
- * The list is capped at 16 addresses.
+ * Controller (CIC side of REQUESTCTL, poll part only): serial poll the
+ * address list to find the first requester (RQS set). Returns the found
+ * index in `*found`, (size_t)-1 if nobody requests; the STBs land in
+ * the results buffer. BLOCKING composite: pumps the instance until the
+ * internal FINDRQS completes. AUD-15 (488.2 17.5.5): a generic RQS is
+ * NOT proof of a request for CONTROL (that requires RQC device
+ * semantics this core does not own) -- NO TCT is issued and
+ * txn_out/block_out are NOT populated. The application decides and, if
+ * the requester truly asked for control, calls gpib_pass_control
+ * itself. The list is capped at 16 addresses.
  */
 gpib_status_t gpib_requestctl_pass(gpib_context_t *ctx, const uint8_t *addrs,
     size_t n, size_t *found, gpib_handle_t *txn_out,

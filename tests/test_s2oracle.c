@@ -131,7 +131,8 @@ static void sh_cross_check(void) {
             if (state == (int)GPIB_SH_SDYS) {
                 /* Forced state has no SGNS->SDYS history; set the settle
                  * window explicitly: elapsed iff the S_T1 bit is set. */
-                prod.t1_deadline_us = (in & S_T1) ? 0u : 4000u;
+                prod.t1_start_us = 1000u; /* R17-03: wrap-safe T1 form */
+            prod.t1_deadline_us = (in & S_T1) ? 0u : 4000u;
             }
             memset(&pin, 0, sizeof(pin));
             /* Faithful mapping: the S_LOS bit means "role lost", which in
@@ -175,7 +176,9 @@ static void ah_cross_check(void) {
             prod.state = (gpib_ah_state_t)state;
             if (state == (int)GPIB_AH_ACDS) {
                 /* Forced state has no ACRS->ACDS history; the T3 window
-                 * is elapsed iff bit5 is set (see the oracle encoding). */
+                 * is elapsed iff bit5 is set (see the oracle encoding).
+                 * R17-04: wrap-safe T3 form (start + duration). */
+                prod.t3_start_us = 1000u;
                 prod.t3_deadline_us = (in & 0x20u) ? 0u : 4000u;
             }
             memset(&pin, 0, sizeof(pin));

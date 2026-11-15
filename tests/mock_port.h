@@ -29,6 +29,10 @@ typedef struct mock_port {
     uint64_t rx_generated;
     /* TX integrity accumulator: sum of every accepted TX byte. */
     uint64_t tx_sum;
+    /* R17-01: the byte-pump journal -- every TX byte in wire order
+     * (the block-order regression reads it). */
+    uint8_t journal[4096];
+    size_t journal_len;
     bool stuck_quiesce;
     bool inhibit_called;
     uint64_t now_us;

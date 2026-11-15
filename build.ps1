@@ -17,7 +17,7 @@ $min = @('-DGPIB_CFG_MAX_OPERATIONS=2','-DGPIB_CFG_MAX_BLOCKS=2','-DGPIB_CFG_TRA
 gcc @warn @src `
     tests\test_main.c tests\test_addr.c tests\test_lifecycle.c tests\test_ledger.c tests\test_txn.c `
     tests\test_mbx.c tests\test_emergency.c tests\test_stream.c tests\test_vbus.c tests\test_trace.c tests\test_deadline.c `
-    tests\test_interleave.c tests\test_litmus.c tests\test_proto.c tests\test_linesim.c tests\test_lineexec.c tests\test_tlc.c tests\test_spoll.c tests\test_devmode.c tests\test_dualcore.c tests\test_rldcdt.c tests\test_m4882.c tests\test_s2oracle.c tests\test_optfeatures.c tests\oracle_peer.c tests\test_oracle.c `
+    tests\test_interleave.c tests\test_litmus.c tests\test_proto.c tests\test_linesim.c tests\test_lineexec.c tests\test_tlc.c tests\test_spoll.c tests\test_devmode.c tests\test_dualcore.c tests\test_rldcdt.c tests\test_m4882.c tests\test_s2oracle.c tests\test_optfeatures.c tests\oracle_peer.c tests\test_oracle.c tests\test_stress.c `
     tests\mock_port.c tests\vbus.c tests\line_sim.c tests\mock_lines.c tests\mock_bus.c `
     -o build\test_s1.exe
 if ($LASTEXITCODE -ne 0) { exit 1 }

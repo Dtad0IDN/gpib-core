@@ -195,7 +195,8 @@ typedef enum gpib_handle_kind {
 typedef struct gpib_handle {
     uint64_t epoch;
     uint16_t slot;
-    uint16_t generation;
+    uint32_t generation; /* H6 (final audit): 32-bit kills the 65 536-op
+                            ABA -- stale handles stay stale */
     uint8_t kind; /* gpib_handle_kind_t */
     uint8_t reserved;
 } gpib_handle_t;

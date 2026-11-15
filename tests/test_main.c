@@ -27,6 +27,7 @@ void suite_m4882(void);
 void suite_s2oracle(void);
 void suite_optfeatures(void);
 void suite_oracle(void);
+void suite_stress(void);
 
 typedef void (*suite_fn_t)(void);
 
@@ -36,14 +37,15 @@ static const suite_fn_t k_suites[] = {
     suite_trace,     suite_deadline,  suite_interleave, suite_litmus,
     suite_proto,     suite_linesim,   suite_lineexec, suite_tlc,
     suite_spoll,     suite_devneg,    suite_dualcore, suite_rldcdt,
-    suite_m4882,     suite_s2oracle,  suite_optfeatures, suite_oracle
+    suite_m4882,     suite_s2oracle,  suite_optfeatures, suite_oracle,
+    suite_stress
 };
 
 static const char *k_names[] = {
     "addr", "lifecycle", "ledger", "txn", "mbx", "emergency", "stream",
     "vbus", "trace", "deadline", "interleave", "litmus", "proto",
     "linesim", "lineexec", "tlc", "spoll", "devneg", "dualcore", "rldcdt",
-    "m4882", "s2oracle", "optfeatures", "oracle"
+    "m4882", "s2oracle", "optfeatures", "oracle", "stress"
 };
 
 unsigned g_checks;

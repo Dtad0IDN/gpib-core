@@ -95,8 +95,28 @@ gpib_status_t gpib_result_ack(gpib_context_t *ctx, gpib_handle_t handle) {
             return GPIB_NO_RESULT;
         }
         /* Ownership returns to the application here and only here
-         * (REQ-032/R9); the generation bump invalidates this handle. */
+         * (REQ-032/R9); the generation bump invalidates this handle.
+         * R17-02 (anti-ABA): a generation must never wrap back into a
+         * value it already held -- a full uint32 turn made a STALE
+         * handle re-validate against a NEW block in the same slot. At
+         * exhaustion the slot is RETIRED from circulation for the rest
+         * of the instance (BLOCK_APP_OWNED is not findable as free
+         * only if we mark it; use the quarantine flag semantics: the
+         * simplest permanent-retire marker is a state the free-finder
+         * skips). */
         struct gpib_block_record *b = &ctx->block[s];
+        if (b->generation == UINT32_MAX) {
+            /* Retire: this slot will never be handed out again. */
+            b->generation = 0;
+            b->state = BLOCK_WAIT_QUIESCENCE; /* not BLOCK_APP_OWNED:
+                                               * find_free skips it */
+            b->retired = true;
+            memset(&b->result, 0, sizeof(b->result));
+            b->txn_slot = 0;
+            b->txn_generation = 0;
+            GPIB_TRACE(ctx, GPIB_TRC_ACK_BLOCK, (uint16_t)s, 0, 1u);
+            return GPIB_OK;
+        }
         b->generation++;
         b->state = BLOCK_APP_OWNED;
         memset(&b->result, 0, sizeof(b->result));
@@ -116,6 +136,20 @@ gpib_status_t gpib_result_ack(gpib_context_t *ctx, gpib_handle_t handle) {
         /* Releases ONLY the transaction slot; block records, block handles
          * and block memory are deliberately untouched (FIX-01/REQ-070). */
         struct gpib_txn_record *t = &ctx->txn[s];
+        if (t->generation == UINT32_MAX) {
+            /* R17-02: retire the slot instead of wrapping -- a wrapped
+             * generation re-validates stale transaction handles. */
+            t->generation = 0;
+            t->state = TXN_RECORD_RELEASED;
+            t->retired = true; /* gpib_ledger_find_free skips retired */
+            memset(&t->address, 0, sizeof(t->address));
+            t->kind = GPIB_REQ_WRITE;
+            t->block_count = 0;
+            t->blocks_terminal = 0;
+            memset(&t->result, 0, sizeof(t->result));
+            GPIB_TRACE(ctx, GPIB_TRC_ACK_TXN, (uint16_t)s, 0, 1u);
+            return GPIB_OK;
+        }
         t->generation++;
         t->state = TXN_RECORD_RELEASED;
         memset(&t->address, 0, sizeof(t->address));

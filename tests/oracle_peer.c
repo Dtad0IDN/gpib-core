@@ -128,6 +128,14 @@ static void acceptor_round(oracle_peer_t *p, bool atn, bool dav,
         return;
     }
     bool room = atn || (p->rx_len < ORACLE_RX_MAX);
+    if (p->hold_byte && !atn && dav && !p->byte_taken) {
+        /* O15: deliberately stall INSIDE the byte cycle: NRFD released
+         * (was ready), NDAC held -- the source waits with DAV asserted,
+         * the byte is provably in flight. */
+        o_set(p, VBL_NRFD, false);
+        o_set(p, VBL_NDAC, true);
+        return;
+    }
     if (dav && !p->byte_taken) {
         if (room) {
             if (atn) {
@@ -148,7 +156,12 @@ static void acceptor_round(oracle_peer_t *p, bool atn, bool dav,
         p->byte_taken = false; /* source saw the accept: byte cycle done */
     }
     o_set(p, VBL_NDAC, true); /* nothing pending: not-accepted idle level */
-    o_set(p, VBL_NRFD, !room);
+    /* Final audit 7.2: a STRICT 488.1 acceptor holds NRFD (not ready)
+     * while the just-accepted byte's DAV is still asserted (the AWNS
+     * output function: rfd released only in AIDS/ACRS). The lenient
+     * version (release both simultaneously) masked source timing
+     * errors. Readiness for the NEXT byte resumes once DAV drops. */
+    o_set(p, VBL_NRFD, !(room && !dav));
 }
 
 /* --- hand-written talker --------------------------------------------------- */
@@ -236,6 +249,12 @@ static void talker_round(oracle_peer_t *p, bool atn, bool nrfd, bool ndac) {
 
 /* --- port callbacks -------------------------------------------------------- */
 
+static bool o_read_lines(void *user, gpib_line_snap_t *snap);
+
+bool oracle_port_read_lines(void *user, gpib_line_snap_t *snap) {
+    return o_read_lines(user, snap);
+}
+
 static bool o_read_lines(void *user, gpib_line_snap_t *snap) {
     oracle_peer_t *p = (oracle_peer_t *)user;
     if (p->read_fail) {
@@ -249,22 +268,34 @@ static bool o_read_lines(void *user, gpib_line_snap_t *snap) {
     bool nrfd = lvl(p, VBL_NRFD);
     bool ndac = lvl(p, VBL_NDAC);
     bool ifc = lvl(p, VBL_IFC);
+    p->ifc_seen_round = ifc; /* one round of legality exemptions */
     bool ren = lvl(p, VBL_REN);
     bool srq = lvl(p, VBL_SRQ);
     uint8_t dio = 0;
     {
         int derr = vbus_dio_level(p->bus, &dio);
-        /* Rev7 §5.3: DAV high with an unresolved DIO contention is an
-         * immediate invariant breach, not something to notice a round
-         * later through the conflicts counter. */
-        if (derr != 0 && dav) {
+        /* Rev10 §5.3: DAV high with an unresolved DIO contention is an
+         * immediate invariant breach -- EXCEPT during an IFC pulse: IFC
+         * legitimately aborts byte cycles mid-flight (the reset releases
+         * the data drivers while the source's DAV edge is still up),
+         * which is normal wire behavior, not a fault (found by the
+         * chaos stress under an injected IFC). */
+        if (derr != 0 && dav && !ifc) {
             p->violations++;
             p->viol_conflict++;
         }
     }
 
     if (ifc) {
-        /* Wire rule: IFC clears addressing and disarms the poll pair. */
+        p->ifc_seen_round = true; /* AUD-11/derr exemptions this round */
+        /* Wire rule (488.1 3.3): IFC clears the INTERFACE functions --
+         * addressing, poll arm, and any in-flight HANDSHAKE (drivers
+         * MUST come off or the controller's next command phase contends
+         * DIO with our stale byte). The application's response DATA
+         * survives: a re-addressed talker resumes from tx_pos, exactly
+         * like a real instrument's output queue (found by the chaos
+         * stress under an injected IFC; arming-then-start ordering in
+         * the directed tests caught the over-eager abandon). */
         p->listen = false;
         p->talk = false;
         p->spe = false;
@@ -273,6 +304,9 @@ static bool o_read_lines(void *user, gpib_line_snap_t *snap) {
         p->pp_configured = false;
         p->pp_window = false;
         p->saw_ifc = true;
+        vbus_release(p->bus, p->self_id, VBL_DAV);
+        vbus_release(p->bus, p->self_id, VBL_EOI);
+        vbus_release_dio(p->bus, p->self_id);
     }
     if (ren) {
         p->saw_ren = true;
@@ -349,8 +383,9 @@ static bool o_read_lines(void *user, gpib_line_snap_t *snap) {
         }
     }
     p->dav_prev = dav;
-    p->last_dav_lvl = dav; /* ring-independent level for INV2 */
-    p->have_last_lvl = true;
+    /* ring-independent level for INV2: the BUS DAV (for acceptor-side
+     * stability checks); o_drive maintains the core's OWN DAV level
+     * separately for the AUD-11 release check. */
     return true;
 }
 
@@ -387,6 +422,10 @@ static void o_drive(void *user, const gpib_line_drive_t *req) {
         p->viol_atn++;
     }
     p->core_atn_prev = req->atn;
+    /* AUD-11: track the core's OWN driven DAV (the snapshot lags by a
+     * round; the release-after-own-DAV-drop must not false-positive). */
+    p->last_dav_lvl = req->dav;
+    p->have_last_lvl = true;
     if (req->atn) {
         vbus_assert(p->bus, p->core_id, VBL_ATN);
     } else {
@@ -432,6 +471,16 @@ static void o_drive(void *user, const gpib_line_drive_t *req) {
 static void o_drive_data(void *user, const uint8_t *value) {
     oracle_peer_t *p = (oracle_peer_t *)user;
     if (value == NULL) {
+        /* AUD-11: DIO drivers released while DAV is still asserted --
+         * the acceptor may be mid-latch. DAV must fall first.
+         * EXCEPT during an IFC pulse: the reset legitimately aborts
+         * byte cycles mid-flight (same exemption as the DIO-read
+         * check; found by the chaos stress under an injected IFC). */
+        if (p->have_last_lvl && p->last_dav_lvl &&
+            p->core_dio_prev != 0xFFu && !p->ifc_seen_round) {
+            p->violations++;
+            p->viol_conflict++;
+        }
         vbus_release_dio(p->bus, p->core_id);
         return;
     }
@@ -477,8 +526,26 @@ bool oracle_port_safe_detached(void *user) {
 }
 
 static bool o_quiesced(void *user) {
-    (void)user;
-    return true;
+    oracle_peer_t *p = (oracle_peer_t *)user;
+    return !p->quiesce_fail; /* N11-06: injectable delayed quiescence */
+}
+
+static void o_inhibit(void *user) {
+    oracle_peer_t *p = (oracle_peer_t *)user;
+    /* H5d (final audit): emergency_inhibit MUST exist -- the first call
+     * of gpib_emergency_stop used to jump through a NULL pointer. The
+     * electrical effect: every line and DIO driver of the core
+     * participant released on the wired-OR bus. */
+    vbus_release(p->bus, p->core_id, VBL_ATN);
+    vbus_release(p->bus, p->core_id, VBL_EOI);
+    vbus_release(p->bus, p->core_id, VBL_DAV);
+    vbus_release(p->bus, p->core_id, VBL_NRFD);
+    vbus_release(p->bus, p->core_id, VBL_NDAC);
+    vbus_release(p->bus, p->core_id, VBL_IFC);
+    vbus_release(p->bus, p->core_id, VBL_REN);
+    vbus_release(p->bus, p->core_id, VBL_SRQ);
+    vbus_release_dio(p->bus, p->core_id);
+    vbus_pp_release(p->bus, p->core_id);
 }
 
 /* --- setup helpers --------------------------------------------------------- */
@@ -498,6 +565,7 @@ void oracle_init(oracle_peer_t *p, vbus_t *bus, int core_id, uint8_t addr) {
     p->base.arm = o_arm;
     p->base.safe_detached = o_detached;
     p->base.executor_quiesced = o_quiesced;
+    p->base.emergency_inhibit = o_inhibit;
     p->core_dio_prev = 0xFFu;
     p->trace_enabled = true; /* the ring records by default (O14 opts out) */
     vbus_attach_as(bus, p->self_id);

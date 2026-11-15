@@ -32,6 +32,11 @@ else()
         -Wall -Wextra -Wpedantic -Werror -Wshadow -Wundef)
 endif()
 
+# TST-01 (independent audit): test_s1 exercises the CONTROLLER-role API
+# surface (submit/CIC gates/list operations). Building it against a
+# DEVICE-role core produces a wrong-complement binary that either fails
+# to link or silently skips the controller paths. Gate it.
+if(GPIB_ROLE STREQUAL "CONTROLLER")
 add_executable(test_s1
     tests/test_main.c
     tests/test_addr.c
@@ -59,6 +64,7 @@ add_executable(test_s1
     tests/test_optfeatures.c
     tests/oracle_peer.c
     tests/test_oracle.c
+    tests/test_stress.c
     tests/mock_port.c
     tests/vbus.c
     tests/line_sim.c
@@ -70,6 +76,7 @@ if(NOT MSVC)
     target_compile_options(test_s1 PRIVATE
         -Wall -Wextra -Wpedantic -Werror -Wshadow -Wundef)
 endif()
+endif() # TST-01 controller-role gate around test_s1
 
 # Device-role build: API smoke + full device-line E2E against a mock
 # controller (test_devmode selects its surface via DEVLINE_DEVICE_BUILD).
@@ -89,7 +96,9 @@ else()
 endif()
 
 enable_testing()
+if(GPIB_ROLE STREQUAL "CONTROLLER")
 add_test(NAME s1 COMMAND test_s1)
+endif()
 add_test(NAME device_smoke COMMAND test_device)
 
 # 4-configuration CI matrix: role x profile, mandatory-subset parity + RAM.
@@ -132,7 +141,10 @@ else()
 endif()
 add_test(NAME bigcfg COMMAND test_bigcfg)
 
+if(GPIB_ROLE STREQUAL "CONTROLLER")
 # R9 §4 / Rev10 §5: the oracle target runs EXACTLY the oracle suite
 # (--suite selects one suite; a numeric argument would run the first N
 # and reintroduce masking by earlier failures).
 add_test(NAME oracle COMMAND test_s1 --suite oracle)
+add_test(NAME stress COMMAND test_s1 --suite stress)
+endif()
