@@ -224,8 +224,8 @@ static void addr_07(void) {
         CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
     }
 
-    /* F08/F12: address-list operations validate the list and the
-     * results sink at the low level. */
+    /* F08/F12 + AUD-02: address-list operations validate the list, the
+     * results sink AND its capacity at the low level. */
     {
         gpib_request_t q;
         uint8_t good[2] = { 6, 7 };
@@ -236,13 +236,19 @@ static void addr_07(void) {
         q.tx_data = with31;
         q.tx_len = 2;
         q.rx_data = stb;
+        q.rx_cap = sizeof(stb);
         CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_INVALID_ARGUMENT);
         q.tx_data = NULL;
         CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_INVALID_ARGUMENT);
         q.tx_data = good;
         q.rx_data = NULL;
+        q.rx_cap = 0;
         CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_INVALID_ARGUMENT);
         q.rx_data = stb;
+        /* AUD-02: a too-small sink is rejected before any side effect. */
+        q.rx_cap = 1;
+        CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_INVALID_ARGUMENT);
+        q.rx_cap = sizeof(stb);
         CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_OK);
         CHECK(gpib_request_cancel(&ctx, t) == GPIB_OK);
         CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
@@ -255,8 +261,27 @@ static void addr_07(void) {
             q.tx_data = good;
             q.tx_len = 2;
             q.rx_data = stb;
+            q.rx_cap = 1; /* AUD-02: capacity enforced here too */
+            CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_INVALID_ARGUMENT);
+            q.rx_cap = sizeof(stb);
             CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_INVALID_ARGUMENT);
             q.find_out = &found;
+            CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_OK);
+            CHECK(gpib_request_cancel(&ctx, t) == GPIB_OK);
+            CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
+            CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
+        }
+        /* AUD-02 (FINDLSTN): one bool per address -- n*sizeof(bool). */
+        {
+            bool results[2] = { false, false };
+            memset(&q, 0, sizeof(q));
+            q.kind = GPIB_REQ_FINDLSTN;
+            q.tx_data = good;
+            q.tx_len = 2;
+            q.rx_data = results;
+            q.rx_cap = 1; /* too small for 2 bools */
+            CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_INVALID_ARGUMENT);
+            q.rx_cap = sizeof(results);
             CHECK(gpib_submit(&ctx, &q, &t, &b) == GPIB_OK);
             CHECK(gpib_request_cancel(&ctx, t) == GPIB_OK);
             CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);

@@ -136,7 +136,12 @@ gpib_status_t gpib_send_commands(gpib_context_t *ctx, const uint8_t *cmds,
 
 gpib_status_t gpib_submit(gpib_context_t *ctx, const gpib_request_t *req,
     gpib_handle_t *txn_out, gpib_handle_t *first_block_out) {
-    if (ctx == NULL || req == NULL || txn_out == NULL) {
+    if (ctx == NULL || req == NULL || txn_out == NULL ||
+        first_block_out == NULL) {
+        /* A13: EVERY accepted request creates a first block record whose
+         * ownership returns only through its ACK -- a NULL output
+         * pointer used to leak that record permanently (no public API
+         * recovers the handle; deinit wedged in BUSY_RESOURCES). */
         return GPIB_INVALID_ARGUMENT;
     }
     if (ctx->lifecycle == GPIB_LC_UNINITIALIZED) {
@@ -188,7 +193,10 @@ gpib_status_t gpib_submit(gpib_context_t *ctx, const gpib_request_t *req,
     case GPIB_REQ_WRITE:
     case GPIB_REQ_WRITE_MANY:
     case GPIB_REQ_DEV_TX:
-        if (req->tx_data == NULL) {
+        /* H4 (final audit): a zero-length block would park the SH in
+         * SGNS forever (no byte to source) -- the API rejects it; the
+         * zero-length POLICY itself stays OPEN-23. */
+        if (req->tx_data == NULL || req->tx_len == 0) {
             return GPIB_INVALID_ARGUMENT;
         }
         break;
@@ -245,6 +253,19 @@ gpib_status_t gpib_submit(gpib_context_t *ctx, const gpib_request_t *req,
              req->kind == GPIB_REQ_FINDLSTN) && req->rx_data == NULL) {
             return GPIB_INVALID_ARGUMENT;
         }
+        /* AUD-02: the results sink must hold EVERY entry the core will
+         * write -- the ASan probe overflowed a 1-byte bool array with a
+         * 2-address FINDLSTN. rx_cap is BYTES: FINDLSTN writes one bool
+         * per address, ALLSPOLL/FINDRQS one STB byte per address. */
+        if (req->kind == GPIB_REQ_ALLSPOLL || req->kind == GPIB_REQ_FINDRQS) {
+            if (req->rx_cap < req->tx_len) {
+                return GPIB_INVALID_ARGUMENT;
+            }
+        } else if (req->kind == GPIB_REQ_FINDLSTN) {
+            if (req->rx_cap < req->tx_len * sizeof(bool)) {
+                return GPIB_INVALID_ARGUMENT;
+            }
+        }
         if (req->kind == GPIB_REQ_FINDRQS && req->find_out == NULL) {
             return GPIB_INVALID_ARGUMENT;
         }
@@ -290,6 +311,7 @@ gpib_status_t gpib_submit(gpib_context_t *ctx, const gpib_request_t *req,
     br->state = BLOCK_CORE_QUEUED;
     br->txn_slot = (uint16_t)t;
     br->txn_generation = tr->generation;
+    br->txn_seq = tr->next_block_seq++; /* R17-01: FIFO order */
     /* First-block staging per kind; default-free for the same reason as
      * the validation switch above (new kinds must be staged explicitly). */
     switch (req->kind) {
@@ -300,20 +322,20 @@ gpib_status_t gpib_submit(gpib_context_t *ctx, const gpib_request_t *req,
         br->is_rx = true;
         break;
     case GPIB_REQ_SPOLL:
-        br->data = &tr->spoll_stb; /* internal one-byte staging */
+        br->data = &br->internal_payload; /* AUD-16: block-owned */
         br->len = 1;
         br->is_rx = true;
         break;
     case GPIB_REQ_TCT:
     case GPIB_REQ_CMDS:
-        br->data = &tr->spoll_stb; /* dummy staging; no data phase runs */
+        br->data = &br->internal_payload; /* dummy; no data phase runs */
         br->len = 1;
         br->is_rx = false;
         break;
     case GPIB_REQ_ALLSPOLL:
     case GPIB_REQ_FINDRQS:
-        br->data = &tr->spoll_stb; /* dummy; the sequencer redirects per
-                                      address into the results buffer */
+        br->data = &br->internal_payload; /* dummy; the sequencer redirects
+                                      per address into the results buffer */
         br->len = 1;
         br->is_rx = false;
         tr->poll_addrs = (const uint8_t *)req->tx_data;
@@ -324,12 +346,20 @@ gpib_status_t gpib_submit(gpib_context_t *ctx, const gpib_request_t *req,
         tr->find_out = req->find_out;
         break;
     case GPIB_REQ_RESET:
-        br->data = &tr->spoll_stb; /* dummy; the sequencer drives *RST */
+        br->data = &br->internal_payload; /* dummy; the sequencer drives *RST */
         br->len = 1;
         br->is_rx = false;
         tr->poll_addrs = (const uint8_t *)req->tx_data;
         tr->poll_count = req->tx_len;
         tr->poll_index = 0;
+        /* A09: the bus-initialization side effects (REN + IFC, 488.2
+         * 17.1 levels 1-2) belong to the ACCEPTED REQUEST, not to the
+         * wrapper -- a raw gpib_submit(RESET) used to run DCL+*RST with
+         * REN/IFC never asserted, reporting COMPLETED for a bus that
+         * was never initialized. Arming here (post-reservation) keeps
+         * rejected submits side-effect-free. */
+        ctx->ren_request = true;
+        ctx->ifc_request = true;
         tr->rst_msg[0] = '*';
         tr->rst_msg[1] = 'R';
         tr->rst_msg[2] = 'S';
@@ -338,12 +368,12 @@ gpib_status_t gpib_submit(gpib_context_t *ctx, const gpib_request_t *req,
         tr->rst_msg[5] = 0;
         break;
     case GPIB_REQ_PPOLL:
-        br->data = &tr->ppr_byte; /* the PPR result byte */
+        br->data = &br->internal_payload; /* AUD-16: block-owned PPR */
         br->len = 1;
         br->is_rx = true;
         break;
     case GPIB_REQ_FINDLSTN:
-        br->data = &tr->spoll_stb; /* dummy; sequencer writes probe results */
+        br->data = &br->internal_payload; /* dummy; sequencer writes probe results */
         br->len = 1;
         br->is_rx = false;
         tr->probe_addrs = (const uint8_t *)req->tx_data;
@@ -455,21 +485,14 @@ gpib_status_t gpib_system_reset(gpib_context_t *ctx, const uint8_t *addrs,
     }
     /* Levels 1-2 run synchronously through the line engine: REN, IFC
      * pulse, DCL. Level 3 (*RST to each address) is queued as the
-     * action's data phase. The bus-affecting requests are armed ONLY
-     * after the submit is accepted: a rejected operation (BUSY, NOT_CIC,
-     * ...) must never pulse IFC or assert REN. */
+     * action's data phase. Since A09 the side effects are armed by the
+     * submit path itself (post-reservation): the wrapper only builds
+     * the request. */
     memset(&r, 0, sizeof(r));
     r.kind = GPIB_REQ_RESET;
     r.tx_data = addrs; /* address list staged through the request */
     r.tx_len = n;
-    {
-        gpib_status_t st = gpib_submit(ctx, &r, txn_out, block_out);
-        if (st == GPIB_OK) {
-            ctx->ren_request = true;
-            ctx->ifc_request = true;
-        }
-        return st;
-    }
+    return gpib_submit(ctx, &r, txn_out, block_out);
 #else
     (void)ctx;
     (void)addrs;
@@ -507,6 +530,13 @@ gpib_status_t gpib_ppoll_configure(gpib_context_t *ctx, uint8_t addr,
         return GPIB_INVALID_ARGUMENT;
     }
     if (dio_line > 7u || sense > 1u) {
+        return GPIB_INVALID_ARGUMENT;
+    }
+    /* A08: the primary address is validated like every other addressed
+     * request -- gpib_mk_mla() masks to five bits, so an out-of-range
+     * value used to silently configure ANOTHER device (addr 38 ->
+     * MLA(6) on the wire). */
+    if (addr > 30u) {
         return GPIB_INVALID_ARGUMENT;
     }
     cmds[0] = gpib_mk_mta(ctx->own_address.primary); /* MTA(ctrl) */
@@ -633,20 +663,37 @@ gpib_status_t gpib_requestctl_pass(gpib_context_t *ctx, const uint8_t *addrs,
                drain++ < 40000) {
             gpib_process(ctx);
         }
-        gpib_result_ack(ctx, fq_b);
-        gpib_result_ack(ctx, fq_t);
+        /* Rev10 §6.2: the ACK results are CHECKED, not ignored -- a
+         * failed ACK means the ledger slots are still held; surface it
+         * in the trace so a wedged drain is diagnosable instead of
+         * silently leaking slots until deinit. */
+        gpib_status_t ack_b = gpib_result_ack(ctx, fq_b);
+        gpib_status_t ack_t = gpib_result_ack(ctx, fq_t);
+        if (ack_b != GPIB_OK || ack_t != GPIB_OK) {
+            GPIB_TRACE(ctx, GPIB_TRC_ACCOUNT, 0xFFFFu, 0xFFFFu,
+                (uint32_t)((ack_t << 8u) | (ack_b & 0xFFu)));
+        }
         return GPIB_BUSY_RESOURCES;
     }
     /* Free the FINDRQS ledger slots: its result (found index) is already
-     * consumed here; the TCT action below needs the slots. */
+     * consumed here; the caller's follow-up needs the slots. */
     gpib_result_ack(ctx, fq_b);
     gpib_result_ack(ctx, fq_t);
     if (*found == (size_t)-1) {
-        return GPIB_NOT_FOUND; /* nobody requesting control */
+        return GPIB_NOT_FOUND; /* nobody requesting service at all */
     }
-    /* Pass control to the requester via TCT. The TCT handles flow to the
-     * caller: the action runs asynchronously and the caller acks it. */
-    return gpib_pass_control(ctx, addrs[*found], txn_out, block_out);
+    /* AUD-15 (488.2 17.5.5): a generic RQS is NOT a request for
+     * control -- it may be MAV, an error or a completed measurement.
+     * The full REQUESTCTL protocol distinguishes RQC (ESR bit + the
+     * request-control path with a return address via the PCB
+     * convention) from ordinary service requests; that requires
+     * device-side semantics this core does not own. The composite
+     * therefore STOPS at the poll: `*found` names the first requester
+     * and its STB is in the results buffer -- the APPLICATION decides
+     * (and, if it really is RQC, issues gpib_pass_control itself).
+     * Blindly TCT-ing the first RQS source used to strip CIC from
+     * this controller on any instrument's data-ready. */
+    return GPIB_OK;
 #else
     (void)ctx;
     (void)addrs;
@@ -660,8 +707,14 @@ gpib_status_t gpib_requestctl_pass(gpib_context_t *ctx, const uint8_t *addrs,
 
 gpib_status_t gpib_submit_block(gpib_context_t *ctx, gpib_handle_t txn,
     const void *data, size_t len, gpib_handle_t *block_out) {
-    (void)len; /* zero-length block policy stays open (OPEN-23) */
-    if (ctx == NULL || data == NULL || block_out == NULL) {
+    /* N12-02 (rev12): a zero-length block reaches the executor with
+     * nothing to transfer and stalls it forever (SH parks in SGNS with
+     * no byte; the transaction never terminalizes). The zero-length
+     * POLICY stays open (OPEN-23) -- until it is defined, the API
+     * rejects len==0 in BOTH directions, exactly like the first block.
+     * A zero-length terminal marker, if ever needed, must be its own
+     * action kind, never a 0-byte TX/RX fed to the FSMs. */
+    if (ctx == NULL || data == NULL || block_out == NULL || len == 0) {
         return GPIB_INVALID_ARGUMENT;
     }
     if (ctx->lifecycle == GPIB_LC_UNINITIALIZED) {
@@ -686,6 +739,7 @@ gpib_status_t gpib_submit_block(gpib_context_t *ctx, gpib_handle_t txn,
     br->state = BLOCK_CORE_QUEUED;
     br->txn_slot = (uint16_t)s;
     br->txn_generation = tr->generation;
+    br->txn_seq = tr->next_block_seq++; /* R17-01: FIFO order */
     br->data = (const uint8_t *)data;
     br->len = len;
     br->is_rx = (tr->kind == GPIB_REQ_READ);
@@ -741,6 +795,14 @@ gpib_status_t gpib_request_cancel(gpib_context_t *ctx, gpib_handle_t txn) {
     }
     /* Local, synchronous shortcut: the instance stays RUNNING (LIF-05); the
      * transaction terminal record follows after all blocks are terminal. */
+    if (ctx->line.rx_session_open &&
+        ctx->line.rx_session_slot == (uint16_t)s &&
+        ctx->line.rx_session_gen == t->generation) {
+        /* C5: the open RECEIVE dies with its transaction -- the next READ
+         * must run a fresh RECEIVE SETUP (asserting ATN takes the bus
+         * back from the old talker), never resume this stream. */
+        ctx->line.rx_session_open = false;
+    }
     t->state = TXN_FINISHING;
     gpib_ledger_terminalize_txn_blocks(ctx, (uint16_t)s);
     gpib_ledger_try_publish_txn(ctx, (uint16_t)s, GPIB_OK, GPIB_TERM_CANCELED,

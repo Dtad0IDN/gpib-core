@@ -8,6 +8,11 @@
 static void m4882_status_model(void) {
     gpib_4882_t m;
     gpib_4882_init(&m, "KILO,GPIB-CORE,0,1.0");
+    /* 488.2 12.2: Power-On latches the PON event (0x80); a real
+     * application reads it via *ESR? -- here *CLS starts the model. */
+    CHECK((m.esr & 0x80u) != 0u);
+    CHECK(gpib_4882_feed(&m, "*CLS\n", 5));
+    CHECK(m.esr == 0);
     CHECK(m.stb == 0);
     CHECK(!m.rsv);
     /* *OPC sets ESR.OPC; without *ESE enable it does not raise ESB. */
@@ -38,6 +43,8 @@ static void m4882_queries(void) {
     size_t len = 0;
     const char *r;
     gpib_4882_init(&m, "KILO,GPIB-CORE,0,1.0");
+    /* PON is latched at init (488.2 12.2): clear it for the flow. */
+    CHECK(gpib_4882_feed(&m, "*CLS\n", 5));
     /* *IDN? queues the identity; MAV rises. */
     CHECK(gpib_4882_feed(&m, "*IDN?\n", 6));
     r = gpib_4882_response(&m, &len);
@@ -139,10 +146,12 @@ static void m4882_audit_regressions(void) {
     size_t len = 0;
     const char *r;
     gpib_4882_init(&m, "KILO,GPIB-CORE,0,1.0");
+    CHECK(gpib_4882_feed(&m, "*CLS\n", 5)); /* clear the PON latch */
 
     /* F22: *RST is NOT *CLS -- ESR and a pending response survive.
      * (Consume the response first: any NEW program message -- *RST
      * included -- destroys an unread response with QYE, see F24.) */
+    CHECK(gpib_4882_feed(&m, "*CLS\n", 5)); /* clear the PON latch */
     CHECK(gpib_4882_feed(&m, "*OPC\n", 5));
     CHECK(m.esr == 0x01u);
     CHECK(gpib_4882_feed(&m, "*IDN?\n", 6));
@@ -208,6 +217,60 @@ static void m4882_audit_regressions(void) {
     CHECK(r == NULL && len == 0);
     CHECK(gpib_4882_feed(&m, "*CLS?\n", sizeof("*CLS?\n") - 1u));
     CHECK((m.esr & 0x20u) != 0u); /* *CLS has no query form */
+
+    /* Final audit: case-INSENSITIVE mnemonics (488.2 7.6) -- "*idn?"
+     * and "*IdN?" are the same command. */
+    CHECK(gpib_4882_feed(&m, "*cls\n", 5));
+    CHECK(m.esr == 0u);
+    CHECK(gpib_4882_feed(&m, "*idn?\n", 6));
+    r = gpib_4882_response(&m, &len);
+    CHECK(r != NULL && len == 20); /* the identity came back */
+    gpib_4882_response_consumed(&m);
+    CHECK(gpib_4882_feed(&m, "*Opc\n", 5));
+    CHECK((m.esr & 0x01u) != 0u);
+
+    /* Final audit AUD-18: END clears the suppression -- an EOI-only
+     * client recovers after an overflow (used to stay silent forever). */
+    CHECK(gpib_4882_feed(&m, "*CLS\n", 5));
+    CHECK(m.esr == 0u);
+    {
+        char big[130];
+        int w = 0;
+        for (int i = 0; i < 100; i++) {
+            big[w++] = 'A';
+        }
+        big[w++] = '\n'; /* overflow line terminates by NL */
+        CHECK(!gpib_4882_feed(&m, big, (size_t)w));
+        CHECK((m.esr & 0x20u) != 0u);
+        /* Now the same but END-terminated (no NL at all). */
+        CHECK(gpib_4882_feed(&m, "*CLS\n", 5));
+        w = 0;
+        for (int i = 0; i < 100; i++) {
+            big[w++] = 'A';
+        }
+        CHECK(!gpib_4882_feed(&m, big, (size_t)w)); /* buffered */
+        CHECK(!gpib_4882_feed_end(&m)); /* overflow: dropped, suppressed */
+        CHECK((m.esr & 0x20u) != 0u);
+        /* AUD-18: the NEXT EOI-only message parses. */
+        CHECK(!gpib_4882_feed(&m, "*OPC", 4));
+        CHECK(gpib_4882_feed_end(&m));
+        CHECK((m.esr & 0x01u) != 0u); /* OPC executed: recovered */
+    }
+
+    /* AUD-19: *ESE without an argument is a command error, NOT a
+     * zero-assignment; the query form takes no argument either. */
+    CHECK(gpib_4882_feed(&m, "*CLS\n", 5));
+    CHECK(gpib_4882_feed(&m, "*ESE 7\n", 7));
+    CHECK(m.ese == 7u);
+    CHECK(m.esr == 0u);
+    CHECK(gpib_4882_feed(&m, "*ESE\n", 5));
+    CHECK((m.esr & 0x20u) != 0u); /* CME */
+    CHECK(m.ese == 7u); /* mask untouched */
+    CHECK(gpib_4882_feed(&m, "*SRE\n", 5));
+    CHECK((m.esr & 0x20u) != 0u); /* same rule for SRE */
+    CHECK(gpib_4882_feed(&m, "*CLS\n", 5));
+    CHECK(gpib_4882_feed(&m, "*ESE? 5\n", 8));
+    CHECK((m.esr & 0x20u) != 0u); /* query with an argument: CME */
 }
 
 void suite_m4882(void) {

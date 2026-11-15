@@ -22,12 +22,31 @@
  * invariants online (DIO stable while DAV asserted; no ATN flip mid
  * byte), so tests can assert on the observed wire, not on core state. */
 
-/* Waveform ring: sized for the LONGEST single scenario (O8 chains
- * WRITE+READ+SPOLL+PPOLL+IFC under REN, ~1500 rounds); wedged scenarios
- * (O14) opt out via trace_enabled instead of overflowing. */
-#define ORACLE_TRACE_MAX 2048u
+/* Waveform ring: sized for the LONGEST single scenario -- the chaos
+ * stress soaks ~12k rounds per seed (24 deadline-bounded ops with
+ * random gaps, drains and settles); wedged scenarios (O14) still opt
+ * out via trace_enabled. */
+#define ORACLE_TRACE_MAX 16384u
 #define ORACLE_CMD_LOG_MAX 64u
 #define ORACLE_RX_MAX 256u
+/* Per-drive journal: ~2 drives per round across a full chaos seed. */
+#define ORACLE_DRIVE_JOURNAL_MAX 32768u
+
+/* Rev10 §4.3: a per-DRIVE journal -- EVERY port->drive() call from the
+ * core is recorded, independently of the per-round snapshot ring. A
+ * transient forbidden release between two snapshots (glitch + correct
+ * pulse inside one round) is invisible to the ring but lands here. */
+typedef struct oracle_drive_rec {
+    uint8_t atn : 1;
+    uint8_t eoi : 1;
+    uint8_t dav : 1;
+    uint8_t nrfd : 1;
+    uint8_t ndac : 1;
+    uint8_t ifc : 1;
+    uint8_t ren : 1;
+    uint8_t srq : 1;
+    uint16_t round; /* snapshot-ring index at the time of the drive */
+} oracle_drive_rec_t;
 
 /* Independent command classification (own encoding table, 488.1 6). */
 typedef enum oracle_cmd {
@@ -98,6 +117,13 @@ typedef struct oracle_peer {
     bool tx_eoi_last;
     bool tx_stall; /* fault injection: never asserts DAV (O6) */
     bool freeze_clock; /* fault injection (O14): snap time stops */
+    bool read_fail; /* fault injection (Rev10 §7): read_lines fails */
+    bool quiesce_fail; /* fault injection (rev11 N11-06): the port never
+                          certifies executor quiescence until cleared */
+    bool hold_byte; /* fault injection (O15): the acceptor NEVER releases
+                     * NDAC for the next byte -- the core's SH waits mid
+                     * cycle, so a cancel strikes a provable in-flight
+                     * byte (deterministic C3 scenario) */
     int tx_phase; /* 0=wait_rfd 1=dav_hold 2=wait_ndac_clear */
     bool stb_mode; /* serial-poll answer overrides tx */
     bool stb_sent;
@@ -126,6 +152,17 @@ typedef struct oracle_peer {
     size_t trace_len;
     bool trace_overflow;   /* Rev6 §5.4: ring exhausted -- must stay 0 */
     bool trace_enabled;    /* O14 wedged scenarios may disable the ring */
+    /* per-drive journal (Rev10 §4.3): captures intra-round glitches */
+    oracle_drive_rec_t dr_journal[ORACLE_DRIVE_JOURNAL_MAX];
+    size_t dr_n;
+    bool dr_overflow;
+    /* last observed levels INDEPENDENT of the ring (Rev10 §6.4): the
+     * drive_data stability check keeps working with tracing disabled */
+    bool last_dav_lvl;
+    bool have_last_lvl;
+    bool ifc_seen_round; /* the CURRENT round observed an IFC pulse:
+                          * mid-byte aborts are legal (AUD-11/derr
+                          * exemptions) */
     unsigned violations;    /* invariant breaches (must stay 0) */
     unsigned viol_atn;      /* split for diagnosis: ATN mid-byte flips */
     unsigned viol_conflict; /* split for diagnosis: vbus conflicts */
@@ -140,6 +177,10 @@ typedef struct oracle_peer {
 } oracle_peer_t;
 
 void oracle_init(oracle_peer_t *p, vbus_t *bus, int core_id, uint8_t addr);
+
+/* Public alias of the port read_lines callback: the chaos stress port
+ * (test_stress.c) wraps it with adversarial bus events each round. */
+bool oracle_port_read_lines(void *user, gpib_line_snap_t *snap);
 
 /* The honest safe_detached evidence function (installed by oracle_init);
  * tests that override the callback can restore it through this alias. */

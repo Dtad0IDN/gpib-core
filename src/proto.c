@@ -239,7 +239,11 @@ void gpib_talker_step(gpib_talker_t *t, const gpib_t_in_t *in,
         if (!in->ifc && (address_match || in->ton)) {
             t->state = GPIB_T_TADS;
             out->talk_addressed = true;
-            t->sec = GPIB_T_TPIS; /* pair consumed by the addressing */
+            /* A05: do NOT consume the pair at addressing -- TPAS must
+             * survive our own SAD so a subsequent OSA can still untalk
+             * us (488.1 2.5.3.8: TPAS exits on PCG&&!MTA, and 2.5.3.2:
+             * TADS exits on OSA&&TPAS). The pair disarms only on the
+             * next primary command. */
         }
         break;
     case GPIB_T_TADS:
@@ -351,7 +355,9 @@ void gpib_listener_step(gpib_listener_t *l, const gpib_l_in_t *in,
                          (in->ltn && in->cacs))) {
             l->state = GPIB_L_LADS;
             out->listen_addressed = true;
-            l->sec = GPIB_L_LPIS; /* pair consumed by the addressing */
+            /* A05: do NOT consume LPAS at addressing (488.1 2.6.3.5:
+             * LPAS exits on PCG&&!MLA) -- a later OSA must still find
+             * the pair armed for the cross-unaddress. */
         }
         break;
     case GPIB_L_LADS:
@@ -441,7 +447,9 @@ void gpib_controller_init(gpib_controller_t *c) {
 }
 
 static void hold_main(gpib_controller_t *c, uint64_t now, uint32_t dur) {
-    c->main_deadline = now + (uint64_t)dur;
+    c->main_start_us = now; /* AUD-21: wrap-safe (start, duration) */
+    c->main_dur_us = (uint64_t)dur;
+    c->main_deadline = now + (uint64_t)dur; /* informational only */
     c->main_hold = true;
 }
 
@@ -473,6 +481,8 @@ void gpib_controller_step(gpib_controller_t *c, const gpib_c_in_t *in,
         if (sc_active) {
             if (in->sic) {
                 c->ifc = GPIB_C_SIAS;
+                c->ifc_start_us = in->now_us; /* AUD-21 wrap-safe */
+                c->ifc_dur_us = (uint64_t)in->t8_us;
                 c->ifc_deadline = in->now_us + (uint64_t)in->t8_us;
                 c->ifc_hold = true;
             } else {
@@ -485,6 +495,8 @@ void gpib_controller_step(gpib_controller_t *c, const gpib_c_in_t *in,
             c->ifc = GPIB_C_SIIS;
         } else if (in->sic) {
             c->ifc = GPIB_C_SIAS;
+            c->ifc_start_us = in->now_us; /* AUD-21 wrap-safe */
+            c->ifc_dur_us = (uint64_t)in->t8_us;
             c->ifc_deadline = in->now_us + (uint64_t)in->t8_us;
             c->ifc_hold = true;
         }
@@ -494,7 +506,9 @@ void gpib_controller_step(gpib_controller_t *c, const gpib_c_in_t *in,
             c->ifc = GPIB_C_SIIS;
             c->ifc_hold = false;
         } else if (!in->sic &&
-                   (!c->ifc_hold || in->now_us >= c->ifc_deadline)) {
+                   (!c->ifc_hold ||
+                    (uint64_t)(in->now_us - c->ifc_start_us) >=
+                        c->ifc_dur_us)) {
             c->ifc = GPIB_C_SINS; /* T8 honored */
             c->ifc_hold = false;
         }
@@ -520,14 +534,17 @@ void gpib_controller_step(gpib_controller_t *c, const gpib_c_in_t *in,
             c->ren_hold = false;
         } else if (in->sre) {
             /* F14: the low-time budget is anchored to the actual wire
-             * edge (SRAS->SRNS stamped ren_released_us). If the line
-             * has already been false long enough, assert immediately;
-             * otherwise wait out the remainder -- never from scratch. */
+             * edge (SRAS->SRNS stamped ren_released_us). AUD-21: the
+             * comparison is wrap-safe ((now - start) >= t8) -- an
+             * absolute deadline wraps at UINT64_MAX. */
             if (!c->ren_hold) {
-                c->ren_deadline = c->ren_released_us + (uint64_t)in->t8_us;
+                c->ren_t8_us = (uint64_t)in->t8_us;
+                c->ren_deadline =
+                    c->ren_released_us + (uint64_t)in->t8_us; /* info */
                 c->ren_hold = true;
             }
-            if (in->now_us >= c->ren_deadline) {
+            if ((uint64_t)(in->now_us - c->ren_released_us) >=
+                c->ren_t8_us) {
                 c->ren = GPIB_C_SRAS;
                 c->ren_hold = false;
             }
@@ -558,8 +575,9 @@ void gpib_controller_step(gpib_controller_t *c, const gpib_c_in_t *in,
     }
     out->srq_active = (c->srq == GPIB_C_CSRS);
 
-    /* Group: main transfer/command/poll chain. */
-    if (c->main_hold && in->now_us >= c->main_deadline) {
+    /* Group: main transfer/command/poll chain. AUD-21: wrap-safe. */
+    if (c->main_hold &&
+        (uint64_t)(in->now_us - c->main_start_us) >= c->main_dur_us) {
         c->main_hold = false;
     }
     bool ext_ifc = in->ifc && !out->ifc_assert; /* someone else's IFC */
@@ -918,14 +936,20 @@ void gpib_sh_step(gpib_sh_t *sh, const gpib_sh_in_t *in, gpib_sh_out_t *out) {
             out->role_lost = true;
         } else if (in->nba) {
             sh->state = GPIB_SH_SDYS;
-            sh->t1_deadline_us = in->now_us + (uint64_t)in->t1_us;
+            /* R17-03: wrap-safe T1 -- record the START, compare by the
+             * modulo difference; an absolute `now + t1` deadline wraps
+             * at UINT64_MAX and let SDYS->STRS fire instantly. */
+            sh->t1_start_us = in->now_us;
+            sh->t1_deadline_us = (uint64_t)in->t1_us;
         }
         break;
     case GPIB_SH_SDYS:
         if (loses) {
             sh->state = GPIB_SH_SIDS;
             out->role_lost = true;
-        } else if (in->rfd && in->now_us >= sh->t1_deadline_us &&
+        } else if (in->rfd &&
+                   (uint64_t)(in->now_us - sh->t1_start_us) >=
+                       sh->t1_deadline_us &&
                    (!in->dac || !sh->require_dac_low)) {
             /* Optional !DAC qualifier (Annex B step 3 error check): with
              * the policy on, refuse to transfer while RFD and DAC are
@@ -1018,7 +1042,9 @@ void gpib_ah_step(gpib_ah_t *ah, const gpib_ah_in_t *in, gpib_ah_out_t *out) {
             ah->state = GPIB_AH_AIDS;
         } else if (in->dav) {
             ah->state = GPIB_AH_ACDS;
-            ah->t3_deadline_us = in->now_us + (uint64_t)in->t3_us;
+            /* R17-04: wrap-safe T3 (start + modulo difference). */
+            ah->t3_start_us = in->now_us;
+            ah->t3_deadline_us = (uint64_t)in->t3_us;
             out->byte_valid = true; /* capture DIO/EOI/ATN now */
         } else if (!in->atn && !in->rdy) {
             ah->state = GPIB_AH_ANRS;
@@ -1027,7 +1053,9 @@ void gpib_ah_step(gpib_ah_t *ah, const gpib_ah_in_t *in, gpib_ah_out_t *out) {
     case GPIB_AH_ACDS:
         if (not_addressed) {
             ah->state = GPIB_AH_AIDS;
-        } else if ((in->atn && in->now_us >= ah->t3_deadline_us) ||
+        } else if ((in->atn &&
+                    (uint64_t)(in->now_us - ah->t3_start_us) >=
+                        ah->t3_deadline_us) ||
                    (!in->atn && !in->rdy)) {
             ah->state = GPIB_AH_AWNS;
             out->accepted_event = true;

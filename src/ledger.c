@@ -5,6 +5,9 @@
 int gpib_ledger_find_free_txn(const struct gpib_context *ctx) {
     for (int i = 0; i < GPIB_CFG_MAX_OPERATIONS; i++) {
         gpib_txn_state_t st = ctx->txn[i].state;
+        if (ctx->txn[i].retired) {
+            continue; /* R17-02: exhausted generation, never reused */
+        }
         if (st == TXN_UNRESERVED || st == TXN_RECORD_RELEASED) {
             return i;
         }
@@ -14,7 +17,8 @@ int gpib_ledger_find_free_txn(const struct gpib_context *ctx) {
 
 int gpib_ledger_find_free_block(const struct gpib_context *ctx) {
     for (int i = 0; i < GPIB_CFG_MAX_BLOCKS; i++) {
-        if (ctx->block[i].state == BLOCK_APP_OWNED) {
+        if (ctx->block[i].state == BLOCK_APP_OWNED &&
+            !ctx->block[i].retired) { /* R17-02: retired never reused */
             return i;
         }
     }
@@ -67,7 +71,7 @@ int gpib_ledger_block_slot(const struct gpib_context *ctx, gpib_handle_t h) {
 }
 
 gpib_handle_t gpib_make_handle(const struct gpib_context *ctx, uint8_t kind,
-    uint16_t slot, uint16_t generation) {
+    uint16_t slot, uint32_t generation) {
     gpib_handle_t h;
     h.epoch = ctx->epoch;
     h.slot = slot;
@@ -110,7 +114,21 @@ void gpib_ledger_try_publish_txn(struct gpib_context *ctx, uint16_t txn_slot,
     t->result.reason = reason;
     t->result.end_cause = end;
     t->result.bytes_confirmed = t->stream_bytes;
+    /* N11/D6: the transaction inherits the WORST byte-fate proof of its
+     * blocks -- a mid-byte abort in ANY block (ATN takeover, IFC, FAULT)
+     * must surface in the transaction result, not vanish in the
+     * aggregation (the hardcoded false here used to mask exactly the
+     * case the final audit's D6 reproduced). */
     t->result.last_byte_uncertain = false;
+    for (int i = 0; i < GPIB_CFG_MAX_BLOCKS; i++) {
+        struct gpib_block_record *b = &ctx->block[i];
+        if (b->txn_slot == txn_slot &&
+            b->txn_generation == t->generation &&
+            b->result.last_byte_uncertain) {
+            t->result.last_byte_uncertain = true;
+            break;
+        }
+    }
     t->result.stb = (t->kind == GPIB_REQ_SPOLL) ? t->spoll_stb
         : (t->kind == GPIB_REQ_PPOLL) ? t->ppr_byte : 0u;
     t->state = TXN_RESULT_READY;
@@ -125,9 +143,16 @@ bool gpib_ledger_all_terminal(const struct gpib_context *ctx) {
     }
     for (int i = 0; i < GPIB_CFG_MAX_BLOCKS; i++) {
         gpib_block_state_t st = ctx->block[i].state;
-        if (st != BLOCK_APP_OWNED && st != BLOCK_RESULT_READY) {
-            return false;
+        if (st == BLOCK_APP_OWNED || st == BLOCK_RESULT_READY) {
+            continue;
         }
+        /* R17-02: a RETIRED slot (generation exhausted) is terminally
+         * out of circulation -- its WAIT_QUIESCENCE-like state must not
+         * block the lifecycle drain. */
+        if (ctx->block[i].retired) {
+            continue;
+        }
+        return false;
     }
     return true;
 }

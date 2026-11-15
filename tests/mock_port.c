@@ -48,6 +48,9 @@ static size_t m_transfer(void *user, gpib_dir_t dir, uint8_t *buf,
     if (dir == GPIB_DIR_TX) {
         for (size_t i = 0; i < n; i++) {
             m->tx_sum += buf[i];
+            if (m->journal_len < sizeof(m->journal)) {
+                m->journal[m->journal_len++] = buf[i]; /* R17-01 */
+            }
         }
         m->tx_accepted += n;
         return n;

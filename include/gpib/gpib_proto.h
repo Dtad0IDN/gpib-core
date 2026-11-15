@@ -267,6 +267,15 @@ typedef struct gpib_controller {
      * share a deadline. */
     uint64_t main_deadline;
     bool main_hold;
+    /* AUD-21: wrap-safe hold windows -- (now - start) >= duration;
+     * an absolute `now + dur` deadline wraps at UINT64_MAX and let the
+     * hold expire instantly. Deadlines above remain for compat but are
+     * no longer authoritative. */
+    uint64_t main_start_us;
+    uint64_t main_dur_us;
+    uint64_t ifc_start_us;
+    uint64_t ifc_dur_us;
+    uint64_t ren_t8_us;
     uint64_t ifc_deadline;
     bool ifc_hold;
     uint64_t ren_deadline;
@@ -452,7 +461,8 @@ typedef enum gpib_sh_state {
 
 typedef struct gpib_sh {
     gpib_sh_state_t state;
-    uint64_t t1_deadline_us; /* T1 settle window end for the current byte */
+    uint64_t t1_start_us;    /* R17-03: T1 window START (wrap-safe) */
+    uint64_t t1_deadline_us; /* T1 settle window DURATION (wrap-safe form) */
     bool in_flight;          /* byte interrupted in STRS: fate unproven */
     bool require_dac_low;    /* optional !DAC guard of the SDYS->STRS row:
                                 refuse to transfer into a passive (empty)
@@ -498,7 +508,8 @@ typedef enum gpib_ah_state {
 
 typedef struct gpib_ah {
     gpib_ah_state_t state;
-    uint64_t t3_deadline_us; /* T3 accept window end (interface messages) */
+    uint64_t t3_start_us;    /* R17-04: T3 window START (wrap-safe) */
+    uint64_t t3_deadline_us; /* T3 accept window DURATION (wrap-safe form) */
 } gpib_ah_t;
 
 typedef struct gpib_ah_in {

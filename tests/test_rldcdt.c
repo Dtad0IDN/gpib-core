@@ -42,8 +42,27 @@ static void rl_vectors(void) {
     CHECK(rl.state == GPIB_RL_LOCS && !out.changed);
     in.lads = true;
 
+    /* RL-12 (final-audit M14 mutation kill): GTL is an ADDRESSED
+     * command -- in REMS with the listener NOT selected it must be
+     * ignored (no local fallback). */
+    gpib_rl_init(&rl, true);
+    in.cmd_valid = true;
+    in.cmd = cmd_of(GPIB_CMD_MLA, 5);
+    gpib_rl_step(&rl, &in, &out); /* -> REMS the qualified way */
+    CHECK(rl.state == GPIB_RL_REMS);
+    in.lads = false; /* foreign/unaddressed */
+    in.cmd = cmd_of(GPIB_CMD_GTL, 0);
+    gpib_rl_step(&rl, &in, &out);
+    CHECK(rl.state == GPIB_RL_REMS); /* GTL ignored without LADS */
+    in.lads = true; /* properly addressed: GTL works */
+    gpib_rl_step(&rl, &in, &out);
+    CHECK(rl.state == GPIB_RL_LOCS);
+
     /* RL-05: REMS, rtl (no simultaneous LLO) -> LOCS. */
     gpib_rl_init(&rl, true); /* re-enter REMS the qualified way */
+    in.cmd_valid = true;
+    in.cmd = cmd_of(GPIB_CMD_MLA, 5); /* own MLA: the qualified path */
+    in.rtl = false;
     gpib_rl_step(&rl, &in, &out);
     CHECK(rl.state == GPIB_RL_REMS);
     in.cmd_valid = false;

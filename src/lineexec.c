@@ -55,9 +55,15 @@ static void sh_reset(struct gpib_context *ctx) {
  * REN edge and devices fall REMOTE->LOCAL. Electrical release of ALL
  * outputs belongs to the PORT layer only (emergency_inhibit /
  * safe_detached), never to an exchange-scoped drive. */
-static void drive_out(struct gpib_context *ctx, gpib_line_drive_t *req) {
+void gpib_lineexec_drive_out(struct gpib_context *ctx,
+    gpib_line_drive_t *req) {
+    /* AUD-07: drive() carries the FULL state of all outputs. The
+     * persistent SR service request must ride EVERY exchange-scoped
+     * drive exactly like REN/IFC: a phase-local zero used to drop SRQ
+     * on the wire while SR stayed in SRQS -- a lost service request. */
     req->ren = ctx->line.sc_ren;
     req->ifc = ctx->line.sc_ifc;
+    req->srq = (ctx->sr.state == GPIB_SR_SRQS);
     ctx->port->drive(ctx->port->user, req);
 }
 
@@ -65,7 +71,23 @@ static void apply_release(struct gpib_context *ctx) {
     gpib_line_drive_t req;
     memset(&req, 0, sizeof(req)); /* transfer lines deasserted; the SC
                                    * pair survives via the composer */
-    drive_out(ctx, &req);
+    gpib_lineexec_drive_out(ctx, &req);
+    ctx->port->drive_data(ctx->port->user, NULL);
+}
+
+/* AUD-10 (488.2 16.2.1): the release at the END of a command action
+ * (SEND COMMAND, epilogues) must NOT open an ATN=0 gap before the idle
+ * drive re-asserts: ATN stays until the next sequence changes it. Data
+ * phases call apply_release() (ATN legitimately falls for the DABs). */
+static void apply_release_hold_atn(struct gpib_context *ctx) {
+    gpib_line_drive_t req;
+    memset(&req, 0, sizeof(req));
+    if (ctx->line.ctrl.main == GPIB_C_CACS ||
+        ctx->line.ctrl.main == GPIB_C_CTRS ||
+        ctx->line.we_drive_atn) {
+        req.atn = true;
+    }
+    gpib_lineexec_drive_out(ctx, &req);
     ctx->port->drive_data(ctx->port->user, NULL);
 }
 
@@ -96,6 +118,14 @@ void gpib_lineexec_release(struct gpib_context *ctx) {
     apply_release(ctx);
 }
 
+/* AUD-10: command-action end keeps ATN (16.2.1). */
+void gpib_lineexec_release_hold_atn(struct gpib_context *ctx) {
+    if (!gpib_line_mode(ctx)) {
+        return;
+    }
+    apply_release_hold_atn(ctx);
+}
+
 void gpib_lineexec_begin(struct gpib_context *ctx) {
     struct gpib_action *a = &ctx->action;
     struct gpib_txn_record *tr = &ctx->txn[a->txn_slot];
@@ -105,12 +135,18 @@ void gpib_lineexec_begin(struct gpib_context *ctx) {
     /* A new action ends any RECEIVE stop-state hold (F13): the next
      * control sequence owns the bus from here. */
     ctx->line.rx_stop_hold = false;
-    if (tr->kind == GPIB_REQ_READ && ctx->line.rx_session_open) {
-        /* F05: continuation of an OPEN READ stream. The remote talker is
-         * still addressed (TACS) and our listener state is latched -- a
-         * fresh RECEIVE SETUP would assert ATN mid-response (488.2
-         * 16.2.5 violation). Resume the data phase directly: the AH
-         * resumes accepting as soon as this block's buffer has room. */
+    ctx->spas_tx_active = false; /* D01: a fresh action never inherits
+                                    a phantom STB from an interrupted
+                                    poll */
+    if (tr->kind == GPIB_REQ_READ && ctx->line.rx_session_open &&
+        ctx->line.rx_session_slot == (uint16_t)a->txn_slot &&
+        ctx->line.rx_session_gen ==
+            ctx->txn[a->txn_slot].generation) {
+        /* F05 + C5: continuation of THIS transaction's OPEN stream (the
+         * slot+generation binding is mandatory: another READ -- or a
+         * cancelled and reused slot -- must run a fresh RECEIVE SETUP,
+         * never resume a stranger's stream). The remote talker is
+         * still addressed (TACS) and our listener state is latched. */
         ctx->line.n_post = 0;
         ctx->line.n_cmds = 0;
         ctx->line.cmd_pos = 0;
@@ -203,11 +239,19 @@ void gpib_lineexec_begin(struct gpib_context *ctx) {
         c[n++] = 0x14u; /* DCL */
     } else if (tr->kind == GPIB_REQ_SPOLL) {
         /* READ STATUS BYTE (488.2 16.2.18): UNL, MLA(controller), SPE,
-         * MTA(device); epilogue SPD, UNT. */
+         * MTA(device)[, SAD]; epilogue SPD, UNT. AUD-12: the secondary
+         * address form -- an extended-address device is polled through
+         * its full MTA+SAD pair (16.2.18 "if the device is addressed
+         * by an extended address, the controller sends the secondary
+         * address as well"). */
         c[n++] = GPIB_UNL_BYTE; /* UNL */
         c[n++] = gpib_mk_mla(own); /* MLA(controller) */
         c[n++] = GPIB_SPE_BYTE; /* SPE: serial poll enable */
         c[n++] = gpib_mk_mta(tr->address.primary); /* MTA(device) */
+        if (tr->address.secondary_present &&
+            tr->address.secondary <= 31u) {
+            c[n++] = gpib_mk_sad(tr->address.secondary);
+        }
         ctx->line.post[0] = GPIB_SPD_BYTE; /* SPD: serial poll disable */
         ctx->line.post[1] = GPIB_UNT_BYTE; /* UNT */
         ctx->line.n_post = 2;
@@ -291,10 +335,13 @@ static void finish_action(struct gpib_context *ctx, gpib_term_reason_t cause,
         !a->eoi_terminated && !a->char_terminated &&
         gpib_line_mode(ctx)) {
         ctx->line.rx_session_open = true;
+        ctx->line.rx_session_slot = (uint16_t)a->txn_slot;
+        ctx->line.rx_session_gen = ctx->txn[a->txn_slot].generation;
         session_kept = true;
         /* no release: the idle drive holds NRFD/NDAC via the flag */
     } else if (cause == GPIB_TERM_COMPLETED &&
-               ctx->txn[a->txn_slot].kind == GPIB_REQ_READ &&
+               (ctx->txn[a->txn_slot].kind == GPIB_REQ_READ ||
+                ctx->txn[a->txn_slot].kind == GPIB_REQ_DEV_RX) &&
                gpib_line_mode(ctx)) {
         /* R6-02/R9 (found by the oracle's DIO-conflict invariant): the
          * terminal RECEIVE enters the stop state through the ACCEPTOR'S
@@ -303,7 +350,11 @@ static void finish_action(struct gpib_context *ctx, gpib_term_reason_t cause,
          * hold, and poll_idle sustains it. Driving the hold from HERE
          * used to clobber the accept pulse in the same round: the
          * source never saw its last byte accepted and kept its DIO
-         * drivers forever (a real talker hangs in SWNS on hardware). */
+         * drivers forever (a real talker hangs in SWNS on hardware).
+         * A03: the same AWNS tail applies to the DEVICE sink -- an
+         * addressed listener must keep NRFD=true/NDAC released until
+         * the external talker drops DAV (488.1 2.4.3.5); the generic
+         * release revoked the accept pulse immediately. */
         stop_state = true;
         ctx->line.rx_stop_hold = true;
         ctx->line.we_drive_atn = false;
@@ -311,7 +362,15 @@ static void finish_action(struct gpib_context *ctx, gpib_term_reason_t cause,
          * drive provides the continuity; the idle drive takes over. */
     }
     if (!session_kept && !stop_state) {
-        gpib_lineexec_release(ctx);
+        if (cause == GPIB_TERM_COMPLETED && ctx->line.we_drive_atn &&
+            gpib_line_mode(ctx) &&
+            ctx->line.ctrl.main != GPIB_C_CIDS) {
+            /* AUD-10: a command-action completing with the bus held:
+             * ATN must NOT gap to zero before the idle drive. */
+            gpib_lineexec_release_hold_atn(ctx);
+        } else {
+            gpib_lineexec_release(ctx);
+        }
     }
     /* F13 (488.2 16.2.6): a TERMINAL RECEIVE leaves the acceptor in the
      * stop state -- NRFD and NDAC held TRUE (electrically LOW) until the
@@ -326,8 +385,41 @@ static void finish_action(struct gpib_context *ctx, gpib_term_reason_t cause,
     }
 }
 static void feed_self_addressing(struct gpib_context *ctx, uint8_t raw) {
+    /* Our own ATN sequences address US too: a controller that sends
+     * MTA(own) must land its talker in TADS (this is how a TCT takeover
+     * through SEND COMMAND works, O18). The T/L pair steps on the
+     * accepted byte exactly like the external path in dev_wait. */
     gpib_ifcmd_t cmd = gpib_decode_atn_byte(raw);
     gpib_addr_step(&ctx->line.addr, &cmd);
+    {
+        gpib_t_in_t tin;
+        gpib_t_out_t tout;
+        memset(&tin, 0, sizeof(tin));
+        tin.atn = true;
+        tin.cmd_valid = true;
+        tin.cmd = cmd;
+        gpib_talker_step(&ctx->line.tk, &tin, &tout);
+        (void)tout;
+    }
+    {
+        gpib_l_in_t lin;
+        gpib_l_out_t lout;
+        memset(&lin, 0, sizeof(lin));
+        lin.atn = true;
+        lin.cmd_valid = true;
+        lin.cmd = cmd;
+        gpib_listener_step(&ctx->line.ln, &lin, &lout);
+        (void)lout;
+    }
+    /* F16 gate for SELF-sent sequences (O18): another controller (us,
+     * addressing ourselves before a takeover) passes control via TCT --
+     * legitimate ONLY when our talker is addressed. A stray self-sent
+     * 0x09 must not hand us the bus. */
+    if (cmd.cls == GPIB_CMD_TCT &&
+        (ctx->line.tk.state == GPIB_T_TADS ||
+         ctx->line.tk.state == GPIB_T_TACS)) {
+        ctx->line.ctrl_tct_pulse = true;
+    }
 }
 
 static gpib_request_kind_t tr_kind(struct gpib_context *ctx) {
@@ -370,7 +462,7 @@ static void sh_phase(struct gpib_context *ctx, const gpib_line_snap_t *snap,
                ctx->line.sh.state == GPIB_SH_STRS);
     req.ifc = ctx->line.sc_ifc; /* SC lines merged into every drive */
     req.ren = ctx->line.sc_ren;
-    drive_out(ctx, &req);
+    gpib_lineexec_drive_out(ctx, &req);
     if (ctx->line.sh.state == GPIB_SH_SGNS && *pos < len) {
         ctx->port->drive_data(ctx->port->user, &bytes[*pos]);
     }
@@ -595,7 +687,7 @@ static void ah_phase(struct gpib_context *ctx, const gpib_line_snap_t *snap,
             memset(&pulse, 0, sizeof(pulse));
             pulse.nrfd = !out.rfd_true;
             pulse.ndac = !out.dac_true;
-            drive_out(ctx, &pulse);
+            gpib_lineexec_drive_out(ctx, &pulse);
         }
         if (ctx->line.rx_eoi) {
             gpib_request_kind_t k = tr_kind(ctx);
@@ -634,7 +726,7 @@ static void ah_phase(struct gpib_context *ctx, const gpib_line_snap_t *snap,
                 memset(&ctx->req, 0, sizeof(ctx->req));
                 ctx->req.nrfd = !out.rfd_true;
                 ctx->req.ndac = !out.dac_true;
-                drive_out(ctx, &ctx->req);
+                gpib_lineexec_drive_out(ctx, &ctx->req);
                 if (k == GPIB_REQ_FINDRQS &&
                     (ctx->txn[a->txn_slot].poll_results
                          [ctx->txn[a->txn_slot].poll_index] &
@@ -670,7 +762,7 @@ static void ah_phase(struct gpib_context *ctx, const gpib_line_snap_t *snap,
                 {
                     req.nrfd = !out.rfd_true;
                     req.ndac = !out.dac_true;
-                    drive_out(ctx, &req);
+                    gpib_lineexec_drive_out(ctx, &req);
                 }
                 ctx->line.seq = (uint8_t)GPIB_LSEQ_EPILOGUE;
                 ctx->line.post_pos = 0;
@@ -696,7 +788,7 @@ static void ah_phase(struct gpib_context *ctx, const gpib_line_snap_t *snap,
     req.ndac = !out.dac_true;
     req.ifc = ctx->line.sc_ifc;
     req.ren = ctx->line.sc_ren;
-    drive_out(ctx, &req);
+    gpib_lineexec_drive_out(ctx, &req);
 }
 
 /* Push one device-function event (DCAS/DTAS/RL change). Overflow is a
@@ -923,6 +1015,17 @@ static void dev_wait_step(struct gpib_context *ctx,
     gpib_line_drive_t req;
     memset(&in, 0, sizeof(in));
     pp_round_eval(ctx, snap); /* PP1 IDY observation (F04) */
+    if (ctx->spas_tx_active && snap->atn) {
+        /* D01 (final audit): an ATN steal aborts any in-flight STB --
+         * the SPAS answer branch below returns before the talker can
+         * leave on its own (its SH feed hardwires atn=false), so the
+         * cancel MUST run ahead of the command-listening branch or the
+         * latch survives the steal and injects the stale STB into the
+         * next data supply. */
+        ctx->spas_tx_active = false;
+        ctx->port->drive_data(ctx->port->user, NULL);
+        sh_reset(ctx);
+    }
     in.atn = snap->atn;
     in.dav = snap->dav;
     in.lads = ctx->line.addr.lads || ctx->line.ln.state != GPIB_L_LIDS;
@@ -932,6 +1035,18 @@ static void dev_wait_step(struct gpib_context *ctx,
     in.t3_us = LNX_T3_US;
     if (snap->atn) {
         gpib_ah_step(&ctx->line.ah, &in, &out);
+        if (!out.byte_valid) {
+            /* AUD-09 (2.10.3.2/2.11.3.2): between accepted command bytes
+             * the ACDS window is CLOSED -- the DC/DT unit FSMs must see
+             * that false level to exit DCAS/DTAS, or a second GET/DCL
+             * in the same command phase is swallowed (one event instead
+             * of two). Feed the no-command round to the DF trio. */
+            gpib_ifcmd_t none;
+            memset(&none, 0, sizeof(none));
+            df_step(ctx, snap, false, none,
+                    ctx->line.ln.state == GPIB_L_LADS ||
+                        ctx->line.ln.state == GPIB_L_LACS);
+        }
         if (out.byte_valid) {
             gpib_ifcmd_t cmd = gpib_decode_atn_byte(snap->dio);
             gpib_addr_step(&ctx->line.addr, &cmd);
@@ -1000,10 +1115,22 @@ static void dev_wait_step(struct gpib_context *ctx,
              * F10: the lads fact comes from the NORMATIVE listener FSM
              * only (LADS/LACS, including the LE pair after MSA(own));
              * the primary-only addr mirror used to fire SDC/GET/GTL at
-             * devices whose secondary addressing was not complete. */
-            df_step(ctx, snap, true, cmd,
+             * devices whose secondary addressing was not complete.
+             * AUD-20 (2.8.3.1): the RL remote-enable trigger is the
+             * acceptance of the device's OWN MLA -- for an LE device
+             * that is the primary MLA(own) itself (the listener FSM
+             * only reaches LADS after the SAD completes, one byte later,
+             * by which time the command class is SECONDARY and the
+             * window is gone). Feed the own-MLA acceptance as an
+             * equivalent lads fact to RL. */
+            {
+                bool lads_fact =
                     ctx->line.ln.state == GPIB_L_LADS ||
-                        ctx->line.ln.state == GPIB_L_LACS);
+                    ctx->line.ln.state == GPIB_L_LACS ||
+                    (cmd.cls == GPIB_CMD_MLA &&
+                     cmd.arg == ctx->own_address.primary);
+                df_step(ctx, snap, true, cmd, lads_fact);
+            }
         }
         memset(&req, 0, sizeof(req));
         req.nrfd = !out.rfd_true;
@@ -1014,12 +1141,15 @@ static void dev_wait_step(struct gpib_context *ctx,
         pp_drive_apply(ctx); /* PPR answer rides alongside (F04) */
         /* A CIC controller HOLDS ATN even while accepting commands (its
          * own ATN reads back TRUE on the wired-OR bus - without this the
-         * drive would oscillate between the command and idle branches). */
+         * drive would oscillate between the command and idle branches).
+         * we_drive_atn keeps the hold through a takeover march (the
+         * stop-path ATN assert walking CSBS->CAWS->CACS, N11-04). */
         if (ctx->line.ctrl.main == GPIB_C_CACS ||
-            ctx->line.ctrl.main == GPIB_C_CTRS) {
+            ctx->line.ctrl.main == GPIB_C_CTRS ||
+            ctx->line.we_drive_atn) {
             req.atn = true;
         }
-        drive_out(ctx, &req);
+        gpib_lineexec_drive_out(ctx, &req);
         return;
     }
     /* Data-mode round: refresh the T/L view, keep DCAS/DTAS windows closed
@@ -1040,6 +1170,23 @@ static void dev_wait_step(struct gpib_context *ctx,
     if (!snap->atn && ctx->line.tk.state == GPIB_T_SPAS &&
         !ctx->spas_tx_active) {
         ctx->spas_tx_active = true;
+        sh_reset(ctx);
+    }
+    if (ctx->spas_tx_active &&
+        (ctx->line.tk.state != GPIB_T_SPAS || snap->atn)) {
+        /* D01 (final audit): the poll was INTERRUPTED mid-STB (ATN steal,
+         * IFC, UNT or takeover -- the talker left SPAS without the byte
+         * being accepted, or ATN is asserted and the SPAS branch below
+         * would keep stepping the SH with a hardwired atn=false, so the
+         * talker can never leave on its own). The old code kept the
+         * latch alive: the stale STB was later injected as the FIRST
+         * byte of the next data supply (a controller that times out a
+         * hung poll and then reads data got 0x62 'D' 'A' 'T' 'A' '!'
+         * instead of "DATA!"), and with no repeat poll the TX action
+         * could never start. Cancel the phantom: drop the latch and the
+         * DIO drivers. */
+        ctx->spas_tx_active = false;
+        ctx->port->drive_data(ctx->port->user, NULL);
         sh_reset(ctx);
     }
     if (ctx->spas_tx_active) {
@@ -1070,7 +1217,7 @@ static void dev_wait_step(struct gpib_context *ctx,
             memset(&sreq, 0, sizeof(sreq));
             sreq.dav = sout.dav_requested;
             sreq.srq = (ctx->sr.state == GPIB_SR_SRQS);
-            drive_out(ctx, &sreq);
+            gpib_lineexec_drive_out(ctx, &sreq);
             if (ctx->line.sh.state == GPIB_SH_SGNS) {
                 ctx->port->drive_data(ctx->port->user, &stb);
             }
@@ -1122,28 +1269,53 @@ static void dev_wait_step(struct gpib_context *ctx,
          * until a control sequence (ATN) or a new action takes over.
          * F05: the same hold expresses READ backpressure between blocks
          * of an OPEN stream: the remote talker waits in SDYS while the
-         * application stages the next buffer. */
+         * application stages the next buffer.
+         * AUD-05 (488.1 2.4.3.5, AWNS): after the LAST accepted byte the
+         * released NDAC must STAY released until the source drops DAV --
+         * NRFD held (not ready) meanwhile. Only then the full stop-state
+         * hold (both lines) begins. The accept pulse width is the
+         * source's to observe, not ours to cut short. */
         req.nrfd = true;
-        req.ndac = true;
+        req.ndac = !snap->dav;
     } else {
         ctx->line.rx_stop_hold = false; /* ATN took the bus: hold ends */
         ctx->line.rx_session_open = false; /* F05: ATN kills the session */
+        if (!snap->atn &&
+            (ctx->line.ln.state == GPIB_L_LADS ||
+             ctx->line.ln.state == GPIB_L_LACS)) {
+            /* AUD-08: an ADDRESSED listener with no RX buffer staged is
+             * in ANRS (not ready) -- it must hold NRFD/NDAC TRUE: the
+             * old passive idle let the CIC's DAV handshakes run away
+             * and bytes were lost on the wire. The bus stalls until
+             * the application supplies a sink (or is unaddressed). */
+            req.nrfd = true;
+            req.ndac = true;
+        }
     }
-    if (ctx->line.ctrl.main != GPIB_C_CIDS &&
-        ctx->action.state == (uint8_t)GPIB_ACTION_EMPTY) {
-        /* CIC and idle: hold the bus (ATN) alongside the SC lines. */
+    if (ctx->line.ctrl.main != GPIB_C_CIDS) {
+        /* H1 (final audit): while the C model is ACTIVE (CACS/CTRS) the
+         * idle drive holds ATN on the wire -- 16.2.1/16.2.9: ATN stays
+         * asserted until another sequence changes it. The old
+         * `action.state == EMPTY` gate released ATN right after every
+         * action (model said CACS, wire said 0). After a data phase the
+         * model sits in CSBS (gts) and no ATN is held -- correct for an
+         * open RECEIVE session (F05). we_drive_atn extends the hold
+         * through a takeover march (stop-path ATN assert, N11-04). */
         req.atn = (ctx->line.ctrl.main == GPIB_C_CACS ||
-                   ctx->line.ctrl.main == GPIB_C_CTRS);
+                   ctx->line.ctrl.main == GPIB_C_CTRS) ||
+                  ctx->line.we_drive_atn;
     }
     pp_drive_apply(ctx); /* release our PPR drivers if the window closed */
-    drive_out(ctx, &req);
+    gpib_lineexec_drive_out(ctx, &req);
 }
 
-/* FINDLSTN probe sub-phases staged in ctx->line.cmd_pos. */
+/* FINDLSTN probe sub-phases staged in ctx->line.cmd_pos (normative
+ * 488.2 17.6.5: NO data byte is ever transferred). */
 enum {
     FL_UNL = 0, /* unlisten the previous candidate */
     FL_MLA,     /* address the current candidate */
-    FL_DAB      /* one probe byte at ATN released */
+    FL_SETTLE,  /* ATN released, wait >= 1.5 ms */
+    FL_SAMPLE   /* read the NDAC level: asserted -> a listener exists */
 };
 
 /* External IFC observed on the wire (F01): reset the device-side
@@ -1166,11 +1338,35 @@ static bool external_ifc_reset(struct gpib_context *ctx,
     sh_reset(ctx);
     gpib_ah_init(&ctx->line.ah);
     gpib_apply_own_address(ctx);
-    gpib_sr_init(&ctx->sr);
-    gpib_pp_init(&ctx->pp, ctx->pp.capable); /* both PP groups to pon */
+    /* M1 (final audit): IFC does NOT touch SR in 488.1 (only pon does);
+     * resetting SR here resurrected a serviced request's SRQ because a
+     * live rsv re-asserts after NPRS. The rsv input alone drives SRQS.
+     * AUD-13: the same holds for the PP configure/response groups --
+     * Fig. 11 has NO IFC arc; only pon, PPD and PPU disarm a
+     * configuration. The old blanket pon used to kill a remotely
+     * configured PPE at the first IFC. */
     ctx->line.rx_session_open = false; /* F05: IFC kills the session */
     ctx->line.rx_stop_hold = false;
+    ctx->spas_tx_active = false; /* D01: IFC kills a phantom STB too */
+    ctx->port->drive_data(ctx->port->user, NULL);
     return true;
+}
+
+void gpib_lineexec_external_ifc(struct gpib_context *ctx) {
+    /* A02: the shared reset body for a QUEUED untagged IFC fact -- the
+     * line-level variant (external_ifc_reset) needs a snapshot; this
+     * wrapper applies the same interface-function reset directly.
+     * Byte-pump ports have no electrical lines -- nothing to release. */
+    sh_reset(ctx);
+    gpib_ah_init(&ctx->line.ah);
+    gpib_apply_own_address(ctx);
+    /* M1/AUD-13: SR and PP are NOT touched by IFC (only pon is). */
+    ctx->line.rx_session_open = false;
+    ctx->line.rx_stop_hold = false;
+    ctx->spas_tx_active = false;
+    if (gpib_line_mode(ctx)) {
+        ctx->port->drive_data(ctx->port->user, NULL);
+    }
 }
 
 void gpib_lineexec_step(struct gpib_context *ctx) {
@@ -1189,16 +1385,37 @@ void gpib_lineexec_step(struct gpib_context *ctx) {
      * own-pulse guard (including the trailing-edge round) lives INSIDE
      * external_ifc_reset: only its verdict may terminate the action. */
     {
-        bool in_flight = ctx->line.sh.in_flight;
+        /* A11 (independent audit): in_flight only latches on the
+         * role-lost transition -- a byte sitting in STRS (DAV up, DAC
+         * not yet seen) is ALSO unproven at an IFC abort: without a
+         * common DAC we cannot know whether ANY listener already took
+         * it. Capture the STRS condition BEFORE the reset wipes the SH. */
+        bool byte_unproven = ctx->line.sh.in_flight ||
+                             ctx->line.sh.state == GPIB_SH_STRS ||
+                             ctx->line.sh.state == GPIB_SH_SWNS ||
+                             ctx->line.sh.state == GPIB_SH_SDYS;
         if (external_ifc_reset(ctx, &snap)) {
             if (a->state == (uint8_t)GPIB_ACTION_ACTIVE) {
-                a->last_byte_uncertain = in_flight;
+                a->last_byte_uncertain = byte_unproven;
                 finish_action(ctx, GPIB_TERM_IFC, false);
                 return;
             }
         }
     }
     sr_round_eval(ctx); /* F18: SR advances during active rounds too */
+    {
+        /* A04 (488.1 2.8.3.3-4): RL must observe the CONTINUOUS REN
+         * level on every active bus round -- the old code fed it only
+         * at command bytes, so dropping REN mid-exchange left a device
+         * stuck in REMS forever (local controls logically locked).
+         * The one-shot command bytes (GTL/LLO) still arrive via the
+         * ACDS feed in dev_wait; this is the continuous-level feed. */
+        gpib_ifcmd_t none;
+        memset(&none, 0, sizeof(none));
+        df_step(ctx, &snap, false, none,
+                ctx->line.ln.state == GPIB_L_LADS ||
+                    ctx->line.ln.state == GPIB_L_LACS);
+    }
     /* Stop latch / deadline already latched a cause: end at this boundary. */
     if (a->state == (uint8_t)GPIB_ACTION_ACTIVE &&
         a->stop_cause != (uint8_t)GPIB_TERM_NONE &&
@@ -1269,15 +1486,32 @@ void gpib_lineexec_step(struct gpib_context *ctx) {
         break;
     case (uint8_t)GPIB_LSEQ_PPOLL_IDY: {
         /* PERFORM PARALLEL POLL (16.15): assert ATN+EOI, hold for T6,
-         * then read the PPR byte and release. The settle is 3 exchanges
-         * (approximate T6, [P]). */
-        if (ctx->line.idy_rounds < GPIB_CFG_IDY_SETTLE_ROUNDS) {
+         * then read the PPR byte and release. AUD-14: T6 is a TIME
+         * bound (Table 39, >= 2 us), not a round counter -- a frozen
+         * clock must stall the poll (no result), a fast clock must not
+         * shorten the settle. The rounds cap only guards a runaway. */
+        if (ctx->line.idy_rounds == 0) {
+            /* First IDY round: stamp the physical start. */
+            ctx->line.idy_start_us = snap.now_us;
+        }
+        if ((snap.now_us - ctx->line.idy_start_us) <
+                (uint64_t)GPIB_CFG_T6_SETTLE_US) {
+            if (ctx->line.idy_rounds >= 100000u) {
+                /* A07 (independent audit): the round cap guards a
+                 * runaway, but a count overflow is NOT proof of a
+                 * settled T6 -- a frozen or dead port clock must fail
+                 * the poll, never fabricate a successful PPR read. */
+                ctx->line.idy_rounds = 0;
+                apply_release(ctx);
+                finish_action(ctx, GPIB_TERM_FAULT, false);
+                break;
+            }
             gpib_line_drive_t sreq;
             memset(&sreq, 0, sizeof(sreq));
             sreq.atn = true;
             sreq.eoi = true;
             sreq.ren = ctx->line.sc_ren;
-            drive_out(ctx, &sreq);
+            gpib_lineexec_drive_out(ctx, &sreq);
             ctx->line.idy_rounds++;
             break;
         }
@@ -1290,14 +1524,16 @@ void gpib_lineexec_step(struct gpib_context *ctx) {
         break;
     }
     case (uint8_t)GPIB_LSEQ_FINDLSTN_PROBE: {
-        /* FINDLSTN (17.6): per candidate, UNL + MLA(addr) with ATN, then
-         * ATN released and ONE dummy DAB probe byte. A listener at addr is
-         * in LADS: its AH holds NDAC low and the byte handshakes. Nobody
-         * addressed: every AH returns to AIDS (passive lines) and the SH
-         * SDYS stall (require_dac_low, Annex B) times out -> absent.
-         * ATN bytes alone can NOT discriminate: all acceptors sync them.
-         * The sub-phase is staged in ctx->line.cmd_pos (FL_* below); the
-         * epilogue (probe_index >= probe_count) sends a final UNL. */
+        /* FINDLSTN (488.2 17.6.5, NORMATIVE): per candidate, UNL +
+         * MLA(addr) with ATN, then ATN FALSE, a settle of at least
+         * 1.5 ms, and a READ of NDAC: an addressed listener's acceptor
+         * holds NDAC asserted (ANRS); nobody addressed -> every AH is
+         * in AIDS with passive lines. NO DAB is ever sourced: the old
+         * probe byte opened a two-talker DIO conflict whenever a
+         * previous talker still had an unconsumed reply (final-audit
+         * blocker, reproduced by the chaos stress). The sub-phase is
+         * staged in ctx->line.cmd_pos (FL_*); the epilogue
+         * (probe_index >= probe_count) sends a final UNL. */
         struct gpib_txn_record *tr = &ctx->txn[a->txn_slot];
         uint8_t byte = 0;
         size_t pos = 0;
@@ -1331,35 +1567,35 @@ void gpib_lineexec_step(struct gpib_context *ctx) {
             ctx->line.we_drive_atn = true;
             sh_phase(ctx, &snap, atn_phase, &byte, 1, &pos, false);
             if (pos == 1 && ctx->line.sh.state == GPIB_SH_SWNS) {
-                /* MLA done: release ATN NOW (and the DIO drivers) so the
-                 * first DAB round does not mistake our own ATN for an
-                 * external steal; the probe byte runs next round. */
-                ctx->line.cmd_pos = (uint8_t)FL_DAB;
+                /* MLA done (17.6.5): release ATN -- the settle window
+                 * runs with ATN FALSE and the controller sources
+                 * NOTHING on DIO (the old DAB probe opened a two-talker
+                 * conflict against a stale talker's reply). AUD-21: the
+                 * deadline is stored as (start, duration) -- wrap-safe. */
+                ctx->line.cmd_pos = (uint8_t)FL_SETTLE;
+                ctx->line.probe_settle_deadline = snap.now_us;
                 apply_release(ctx);
-                sh_reset(ctx);
             }
             break;
         }
-        /* FL_DAB: the DAB probe, ATN released. */
-        atn_phase = false;
-        ctx->line.we_drive_atn = false;
-        sh_phase(ctx, &snap, atn_phase, &byte, 1, &pos, false);
-        if (pos == 1 && ctx->line.sh.state == GPIB_SH_SWNS) {
-            /* Handshake completed: a listener at this address accepted. */
-            tr->probe_results[tr->probe_index] = true;
-            tr->probe_index++;
-            ctx->line.cmd_pos = (uint8_t)FL_UNL;
-            sh_reset(ctx);
-        } else if (ctx->line.sh.state == GPIB_SH_SDYS &&
-                   ctx->line.sh.t1_deadline_us != 0 &&
-                   snap.now_us > ctx->line.sh.t1_deadline_us + GPIB_CFG_PROBE_TIMEOUT_US) {
-            /* SDYS stall: NRFD and NDAC both released (no active acceptor,
-             * Annex B error check) -> nobody listens at this address. */
-            tr->probe_results[tr->probe_index] = false;
-            tr->probe_index++;
-            ctx->line.cmd_pos = (uint8_t)FL_UNL;
-            sh_reset(ctx);
+        if (ctx->line.cmd_pos == (uint8_t)FL_SETTLE) {
+            /* ATN FALSE for >= 1.5 ms: an addressed listener's AH
+             * settles into ANRS (NDAC asserted); unaddressed devices
+             * are in AIDS with passive lines. */
+            ctx->line.we_drive_atn = false;
+            if ((uint64_t)(snap.now_us - ctx->line.probe_settle_deadline) >=
+                (uint64_t)GPIB_CFG_FINDLSTN_SETTLE_US) {
+                ctx->line.cmd_pos = (uint8_t)FL_SAMPLE;
+            }
+            break;
         }
+        /* FL_SAMPLE: read the wired-OR NDAC level -- asserted means an
+         * acceptor is active at the probed address (present). */
+        ctx->line.we_drive_atn = false;
+        tr->probe_results[tr->probe_index] = snap.ndac;
+        tr->probe_index++;
+        ctx->line.cmd_pos = (uint8_t)FL_UNL;
+        sh_reset(ctx);
         break;
     }
     case (uint8_t)GPIB_LSEQ_POLL_ADDR: {

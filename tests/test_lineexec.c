@@ -369,8 +369,34 @@ static void e2e_07_stop_conditions(void) {
         CHECK(res.end_cause == expect_end);
         CHECK(res.bytes_confirmed == expect_len);
         CHECK(memcmp(rxbuf, resp, expect_len) == 0);
-        drain_and_ack(&ctx, b, t);
-        CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
+    drain_and_ack(&ctx, b, t);
+    /* AUD-12: SPOLL to an extended address sends MTA+SAD in the prologue
+     * (16.2.18). The primary-armed mock talker will not answer (TIMEOUT
+     * by deadline) -- but the COMMAND LOG proves the SAD is on the wire. */
+    {
+        gpib_handle_t t2 = { 0, 0, 0, 0, 0 };
+        gpib_handle_t b2 = { 0, 0, 0, 0, 0 };
+        size_t n0 = port.ins.n_cmdlog;
+        memset(&r, 0, sizeof(r));
+        r.kind = GPIB_REQ_SPOLL;
+        r.address.primary = 6;
+        r.address.secondary = 2;
+        r.address.secondary_present = true;
+        r.deadline_us = 6000;
+        CHECK(gpib_submit(&ctx, &r, &t2, &b2) == GPIB_OK);
+        res = wait_txn(&ctx, t2);
+        CHECK(res.reason == GPIB_TERM_TIMEOUT);
+        /* UNL, MLA(5), SPE, MTA(6), SAD(2), SPD, UNT -- the mock's
+         * primary-armed talker ignores MTA+SAD, so no STB comes; the
+         * count is 5 (the epilogue SPD/UNT race the deadline stop). */
+        CHECK(port.ins.n_cmdlog >= n0 + 5u);
+        CHECK(port.ins.cmdlog[n0 + 3u].cls == GPIB_CMD_MTA &&
+              port.ins.cmdlog[n0 + 3u].arg == 6);
+        CHECK(port.ins.cmdlog[n0 + 4u].cls == GPIB_CMD_SECONDARY &&
+              port.ins.cmdlog[n0 + 4u].arg == 2);
+        drain_and_ack(&ctx, b2, t2);
+    }
+    CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
         CHECK(gpib_process(&ctx) == GPIB_OK);
         CHECK(gpib_deinit(&ctx) == GPIB_OK);
     }
@@ -500,9 +526,9 @@ static void e2e_10_findlstn(void) {
     CHECK(port.ins.cmdlog[4].cls == GPIB_CMD_UNL);
     CHECK(port.ins.cmdlog[5].cls == GPIB_CMD_MLA && port.ins.cmdlog[5].arg == 30);
     CHECK(port.ins.cmdlog[6].cls == GPIB_CMD_UNL);
-    /* The only present listener took the dummy probe DAB byte. */
-    CHECK(port.ins.rxlen == 1);
-    CHECK(port.ins.rx[0] == 0x00u);
+    /* Normative 17.6.5 (no DAB): the listener received NO probe byte --
+     * detection is by the NDAC level alone. */
+    CHECK(port.ins.rxlen == 0);
     /* Epilogue UNL: the instrument is left unlistened. */
     CHECK(port.ins.addr.lads == false);
     drain_and_ack(&ctx, b, t);
@@ -511,10 +537,12 @@ static void e2e_10_findlstn(void) {
     CHECK(gpib_deinit(&ctx) == GPIB_OK);
 }
 
-/* E2E-11: REQUESTCTL (17.5), CIC side. The instrument requests control
- * (STB with RQS); requestctl_pass FINDRQS-locates it and passes control
- * with TCT. Afterwards the core is no longer CIC: controller submits
- * fail NOT_CIC. */
+/* E2E-11: REQUESTCTL poll side (17.5, AUD-15 semantics). The instrument
+ * raises RQS; requestctl_pass FINDRQS-locates it and RETURNS -- a
+ * generic RQS is NOT proof of a request for control (that requires the
+ * RQC device semantics this core does not own), so no automatic TCT
+ * strips CIC. The application decides and, if it really is RQC, calls
+ * gpib_pass_control itself. */
 static void e2e_11_requestctl(void) {
     GPIB_CONTEXT_STORAGE_DEFINE(ctx);
     mock_line_port_t port;
@@ -524,34 +552,33 @@ static void e2e_11_requestctl(void) {
     gpib_request_t r;
     uint8_t addrs[1] = { 6 };
     size_t found = (size_t)-1;
-    bool saw_tct = false;
+    bool saw_poll = false;
     start_line(&ctx, &port);
-    /* The instrument requests control: RQS asserted in its status byte. */
+    /* The instrument requests service: RQS asserted in its status byte. */
     mock_lines_set_stb(&port, 0x40u, true);
     CHECK(gpib_requestctl_pass(&ctx, addrs, 1, &found, &t, &b) == GPIB_OK);
     CHECK(found == 0); /* the requester is addrs[0] */
-    /* The TCT runs asynchronously: wait for its completion. */
-    res = wait_txn(&ctx, t);
-    CHECK(res.reason == GPIB_TERM_COMPLETED);
-    /* The instrument observed the poll pair and the TCT handoff: the
-     * target is addressed MTA(6) first, then the fixed TCT byte (the
-     * command itself carries no address). */
-    for (size_t i = 0; i + 1 < port.ins.n_cmdlog; i++) {
-        if (port.ins.cmdlog[i].cls == GPIB_CMD_MTA &&
-            port.ins.cmdlog[i].arg == 6 &&
-            port.ins.cmdlog[i + 1].cls == GPIB_CMD_TCT) {
-            saw_tct = true;
+    /* No asynchronous TCT follows: the composite stops at the poll. */
+    for (int i = 0; i < 16; i++) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    for (size_t i = 0; i < port.ins.n_cmdlog; i++) {
+        if (port.ins.cmdlog[i].cls == GPIB_CMD_SPE) {
+            saw_poll = true;
         }
     }
-    CHECK(saw_tct);
-    drain_and_ack(&ctx, b, t);
-    /* Control left with the requester: new controller submits -> NOT_CIC. */
+    CHECK(saw_poll); /* the FINDRQS poll ran on the wire */
+    /* CIC is RETAINED: a generic RQS must not hand the bus away. */
     memset(&r, 0, sizeof(r));
     r.kind = GPIB_REQ_WRITE;
     r.address.primary = 6;
     r.tx_data = s_tx;
     r.tx_len = 8;
-    CHECK(gpib_submit(&ctx, &r, &t, &b) == GPIB_NOT_CIC);
+    CHECK(gpib_submit(&ctx, &r, &t, &b) == GPIB_OK);
+    res = wait_txn(&ctx, t);
+    CHECK(res.reason == GPIB_TERM_COMPLETED);
+    CHECK(res.bytes_confirmed == 8);
+    drain_and_ack(&ctx, b, t);
     CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
     CHECK(gpib_process(&ctx) == GPIB_OK);
     CHECK(gpib_deinit(&ctx) == GPIB_OK);

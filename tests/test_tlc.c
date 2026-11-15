@@ -448,14 +448,31 @@ static void ctrl_ren(void) {
         pin.rsc = true;
         pin.sre = true;
         pin.now_us = 160u; /* past T8 counted from wire-on (time 0) */
-        /* A few steps: SRIS -> SRNS (SC group activates) -> armed ->
-         * asserted. With a POISONED ren_released_us the deadline would
-         * sit at 0xA5A5... and REN would never assert. */
         for (int i = 0; i < 4; i++) {
             gpib_controller_step(&p, &pin, &pout);
         }
         CHECK(p.ren == GPIB_C_SRAS); /* NOT stuck: deadline reachable */
         CHECK(pout.ren_assert);
+        /* M09/M24 mutation kill: T8 must be STRICTLY greater than 100 us.
+         * The FSM gate is >=, the strictness comes from the FED value
+         * (the sequencer feeds GPIB_CFG_T8_STRICT_US = 101); the vector
+         * feeds 101 exactly like production and probes the edge: at
+         * released+100 still SRNS, at released+101 SRAS. */
+        uint32_t t8_saved = pin.t8_us;
+        pin.t8_us = 101u; /* as the sequencer feeds (GPIB_CFG_T8_STRICT) */
+        pin.sre = false;
+        pin.now_us = 1000u;
+        gpib_controller_step(&p, &pin, &pout); /* SRAS -> SRNS, stamp */
+        CHECK(p.ren == GPIB_C_SRNS);
+        pin.sre = true;
+        pin.now_us = 1100u; /* exactly 100 us since the release edge */
+        gpib_controller_step(&p, &pin, &pout);
+        CHECK(p.ren == GPIB_C_SRNS); /* boundary: not yet -- need >100 */
+        pin.now_us = 1101u;
+        gpib_controller_step(&p, &pin, &pout);
+        CHECK(p.ren == GPIB_C_SRAS); /* 101 us: asserted */
+        CHECK(pout.ren_assert);
+        pin.t8_us = t8_saved;
     }
 }
 

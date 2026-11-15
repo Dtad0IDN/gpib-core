@@ -29,6 +29,7 @@ typedef struct gpib_4882 {
     uint8_t sre;
     char line_buf[96];
     size_t line_len;
+    bool line_suppressed; /* overflow: the WHOLE line incl. tail drops */
     char resp[96];
     size_t resp_len;
     bool resp_overflow; /* QYE latched: the message was dropped */

@@ -27,7 +27,7 @@ int gpib_ledger_txn_slot(const struct gpib_context *ctx, gpib_handle_t h);
 int gpib_ledger_block_slot(const struct gpib_context *ctx, gpib_handle_t h);
 
 gpib_handle_t gpib_make_handle(const struct gpib_context *ctx, uint8_t kind,
-    uint16_t slot, uint16_t generation);
+                               uint16_t slot, uint32_t generation);
 
 /* Terminalize all still-queued correlated blocks as NOT_STARTED. Valid in
  * this increment because no executor exists: never_dispatched is provable
@@ -103,6 +103,23 @@ void gpib_apply_own_address(struct gpib_context *ctx);
 /* Off-bus electrical detach: releases EVERY output including the SC pair.
  * Called once at the STOPPING->DRAINING boundary (T8-01). */
 void gpib_lineexec_detach(struct gpib_context *ctx);
+
+/* AUD-10: command-action end keeps ATN held (16.2.1). */
+void gpib_lineexec_release_hold_atn(struct gpib_context *ctx);
+
+/* AUD-17: bounded drain of the port event queue from idle/queued
+ * rounds. Consumes HISTORY_LOST and untagged facts; stale tagged facts
+ * are discarded by generation. */
+void gpib_executor_pump_events(struct gpib_context *ctx, int budget);
+
+/* A02: reset the device-side interface functions on an UNTAGGED queued
+ * IFC fact (works with and without a live action). */
+void gpib_lineexec_external_ifc(struct gpib_context *ctx);
+
+/* The drive composer (R7-01): merges the persistent SC lines into every
+ * exchange-scoped drive. Exported for the executor's stop path (C3). */
+void gpib_lineexec_drive_out(struct gpib_context *ctx,
+    gpib_line_drive_t *req);
 
 void gpib_lineexec_begin(struct gpib_context *ctx);
 /* One bounded bus exchange: read snapshot, step SH/AH, apply drives.

@@ -192,6 +192,43 @@ gpib_status_t gpib_process(gpib_context_t *ctx) {
     case GPIB_LC_RUNNING:
         /* One bounded owner slice: account -> publish -> step (PRG-02). */
         for (int budget = GPIB_CFG_PROCESS_BUDGET; budget > 0; budget--) {
+            /* AUD-04: deadlines bind ACCEPTED TRANSACTIONS, not only the
+             * dispatched action. An OPEN stream waiting for its next RX
+             * buffer or queued behind the session/CIC gates used to run
+             * forever although the application set a deadline. Line mode
+             * only: byte-pump actions dispatch immediately and their own
+             * deadline latch in executor_step covers them. */
+            if (gpib_line_mode(ctx)) {
+                uint64_t now = ctx->port->now_us(ctx->port->user);
+                for (int i = 0; i < GPIB_CFG_MAX_OPERATIONS; i++) {
+                    struct gpib_txn_record *tr = &ctx->txn[i];
+                    if (tr->state != TXN_OPEN || tr->deadline_us == 0) {
+                        continue;
+                    }
+                    /* A dispatched action carries the same deadline and
+                     * ends through the executor's stop path (which also
+                     * cuts the in-flight byte safely); do not race it. */
+                    if ((ctx->action.state ==
+                             (uint8_t)GPIB_ACTION_ACTIVE ||
+                         ctx->action.state ==
+                             (uint8_t)GPIB_ACTION_PUBLISHED) &&
+                        ctx->action.txn_slot == (uint16_t)i) {
+                        continue;
+                    }
+                    if (now < tr->deadline_us) {
+                        continue;
+                    }
+                    if (ctx->line.rx_session_open &&
+                        ctx->line.rx_session_slot == (uint16_t)i &&
+                        ctx->line.rx_session_gen == tr->generation) {
+                        ctx->line.rx_session_open = false;
+                    }
+                    tr->state = TXN_FINISHING;
+                    gpib_ledger_terminalize_txn_blocks(ctx, (uint16_t)i);
+                    gpib_ledger_try_publish_txn(ctx, (uint16_t)i, GPIB_OK,
+                        GPIB_TERM_TIMEOUT, GPIB_END_NONE);
+                }
+            }
             if (ctx->action.state == (uint8_t)GPIB_ACTION_QUIESCED) {
                 gpib_executor_account(ctx);
             }
@@ -205,6 +242,12 @@ gpib_status_t gpib_process(gpib_context_t *ctx) {
                         continue;
                     }
                     if (gpib_line_mode(ctx)) {
+                        /* AUD-17: drain the mandatory event queue BEFORE
+                         * the idle observation -- HISTORY_LOST and
+                         * untagged port facts must be processed between
+                         * operations, not only with an ACTIVE action. */
+                        gpib_executor_pump_events(ctx,
+                            GPIB_CFG_PROCESS_BUDGET);
                         /* Idle bus observation: keep the SRQ monitor and
                          * the simulated peers progressing. */
                         gpib_lineexec_poll_idle(ctx);
@@ -264,6 +307,9 @@ gpib_status_t gpib_process(gpib_context_t *ctx) {
          * so an honest port's safe_detached() can certify the detach
          * without trusting a stub. */
         gpib_lineexec_detach(ctx);
+        /* C2: the instance-wide stop latch is fully consumed here (its
+         * targets are all terminal by the guard above). */
+        ctx->stop_request.active = false;
         ctx->lifecycle = GPIB_LC_DRAINING;
         GPIB_TRACE(ctx, GPIB_TRC_DRAINING, 0, 0, 0);
     }
@@ -439,6 +485,14 @@ gpib_status_t gpib_remote_enable(gpib_context_t *ctx, bool enable) {
     }
     if (!ctx->system_controller) {
         return GPIB_UNSUPPORTED; /* C3: system controller only */
+    }
+    if (ctx->lifecycle != GPIB_LC_INITIALIZED &&
+        ctx->lifecycle != GPIB_LC_RUNNING) {
+        /* D04 (independent audit): default-deny -- a STOPPING/DRAINING
+         * instance must not accept protocol requests; the old code
+         * returned OK and mutated ren_request with no electrical
+         * effect, misleading the diagnostics. */
+        return GPIB_INVALID_STATE;
     }
     ctx->ren_request = enable;
     return GPIB_OK;
