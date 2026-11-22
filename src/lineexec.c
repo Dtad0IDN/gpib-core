@@ -1,3 +1,7 @@
+/**
+ * @file lineexec.c
+ * @brief Line-level sequencer: CMD/DATA_TX/DATA_RX/EPILOGUE/POLL_ADDR/PPOLL_IDY/FINDLSTN_PROBE phases, the drive composer, external IFC reset, device PP1 integration.
+ */
 #include <string.h>
 
 #include "gpib_internal.h"
@@ -55,8 +59,16 @@ static void sh_reset(struct gpib_context *ctx) {
  * REN edge and devices fall REMOTE->LOCAL. Electrical release of ALL
  * outputs belongs to the PORT layer only (emergency_inhibit /
  * safe_detached), never to an exchange-scoped drive. */
+/**
+ * @brief The single drive composer: merges persistent SC lines into every request.
+ * @param ctx Instance context.
+ * @param req Line drive request (modified in place).
+ * @note R7-01: every sequencer drive MUST flow through here;
+ *       REN/IFC/SRQ persist across exchange-scoped releases.
+ */
 void gpib_lineexec_drive_out(struct gpib_context *ctx,
     gpib_line_drive_t *req) {
+#if GPIB_CFG_ROLE == GPIB_ROLE_CONTROLLER
     /* AUD-07: drive() carries the FULL state of all outputs. The
      * persistent SR service request must ride EVERY exchange-scoped
      * drive exactly like REN/IFC: a phase-local zero used to drop SRQ
@@ -64,6 +76,12 @@ void gpib_lineexec_drive_out(struct gpib_context *ctx,
     req->ren = ctx->line.sc_ren;
     req->ifc = ctx->line.sc_ifc;
     req->srq = (ctx->sr.state == GPIB_SR_SRQS);
+#else
+    /* PERF (weak-MCU device build): a device never drives REN or IFC
+     * (C2/C3 are SC-only); SRQ is the only persistent line it owns.
+     * Skip the two SC reads and their stores. */
+    req->srq = (ctx->sr.state == GPIB_SR_SRQS);
+#endif
     ctx->port->drive(ctx->port->user, req);
 }
 
@@ -472,8 +490,14 @@ static void sh_phase(struct gpib_context *ctx, const gpib_line_snap_t *snap,
             if (ctx->line.cmd_pos == ctx->line.n_cmds &&
                 ctx->line.sh.state == GPIB_SH_SWNS) {
                 /* TCT byte completed: CTRS -> CIDS happens in the FSM step;
-                 * the action itself is done. */
+                 * the action itself is done.
+                 * L-04 (final static audit): we are HANDING THE BUS AWAY --
+                 * we_drive_atn MUST die BEFORE finish_action or the old
+                 * CIC holds ATN forever while sitting in CIDS (the idle
+                 * drive obeys the stale flag; the new CIC can never run
+                 * a data phase on a wired-OR bus). */
                 ctx->line.send_tct = false;
+                ctx->line.we_drive_atn = false;
                 finish_action(ctx, GPIB_TERM_COMPLETED, false);
             }
             return;
@@ -498,7 +522,7 @@ static void sh_phase(struct gpib_context *ctx, const gpib_line_snap_t *snap,
                      * hear the next device's *RST. */
                     ctx->line.cmds[0] = gpib_mk_mta(ctx->own_address.primary);
                     ctx->line.cmds[1] = GPIB_UNL_BYTE;
-                    ctx->line.cmds[2] = (uint8_t)(0x20u |
+                    ctx->line.cmds[2] = gpib_mk_mla(
                         tr2->poll_addrs[tr2->poll_index]);
                     ctx->line.n_cmds = 3;
                     ctx->line.cmd_pos = 0;
@@ -556,7 +580,7 @@ static void sh_phase(struct gpib_context *ctx, const gpib_line_snap_t *snap,
             if (tr3->poll_index < tr3->poll_count) {
                 ctx->line.cmds[0] = gpib_mk_mta(ctx->own_address.primary);
                 ctx->line.cmds[1] = GPIB_UNL_BYTE;
-                ctx->line.cmds[2] = (uint8_t)(0x20u |
+                ctx->line.cmds[2] = gpib_mk_mla(
                     tr3->poll_addrs[tr3->poll_index]);
                 ctx->line.n_cmds = 3;
                 ctx->line.cmd_pos = 0;
@@ -1378,9 +1402,6 @@ void gpib_lineexec_step(struct gpib_context *ctx) {
     ctx->line.srq_seen = snap.srq;
     /* F01: external IFC has priority over every data/command logic: the
      * in-flight exchange is aborted with the IFC terminal cause (the
-     * last byte fate is unproven) and the functions return to pon. */
-    /* F01: external IFC has priority over every data/command logic: the
-     * in-flight exchange is aborted with the IFC terminal cause (the
      * last byte fate is unproven) and the functions return to pon. The
      * own-pulse guard (including the trailing-edge round) lives INSIDE
      * external_ifc_reset: only its verdict may terminate the action. */
@@ -1516,10 +1537,14 @@ void gpib_lineexec_step(struct gpib_context *ctx) {
             break;
         }
         /* Read the PPR byte: the DIO lines carry the wired-OR of all
-         * configured PP devices that matched their sense bit. */
+         * configured PP devices that matched their sense bit.
+         * L-01 (final static audit): NO bare apply_release here -- it
+         * drives atn=0 for one round before finish_action's hold puts
+         * it back (a 16.2.1 violation: ATN stays until the next
+         * sequence). Let finish_action route through release_hold_atn,
+         * which holds ATN while the C model is active. */
         ctx->txn[a->txn_slot].ppr_byte = snap.dio;
         ctx->line.idy_rounds = 0;
-        apply_release(ctx);
         finish_action(ctx, GPIB_TERM_COMPLETED, false);
         break;
     }
@@ -1634,13 +1659,16 @@ void gpib_lineexec_step(struct gpib_context *ctx) {
         if (snap.atn && !ctx->line.we_drive_atn) {
             bool dev = ctx->txn[a->txn_slot].kind == GPIB_REQ_DEV_TX ||
                        ctx->txn[a->txn_slot].kind == GPIB_REQ_DEV_RX;
-            ctx->line.seq = (uint8_t)(dev ? GPIB_LSEQ_DEV_WAIT
-                                          : GPIB_LSEQ_LISTEN_CMDS);
             if (!dev) {
                 gpib_ah_init(&ctx->line.ah);
             }
             /* External controller stole the bus mid-data: P1 yield with
-             * the confirmed prefix; continue listening for commands. */
+             * the confirmed prefix. NOTE: unlike DATA_TX, the acceptor's
+             * natural post-steal state is IDLE (NOT LISTEN_CMDS): the
+             * next process call observes the usurper's commands through
+             * poll_idle->dev_wait_step, which feeds the full T/L/PP/DF
+             * chain -- the LISTEN_CMDS path skips T/L and the device
+             * addressing would go stale (caught by the chaos stress). */
             finish_action(ctx, GPIB_TERM_PHASE_INTERRUPTED, false);
             return;
         }

@@ -159,6 +159,16 @@ static void sh_cross_check(void) {
             }
             CHECK(prod.state == want);
             CHECK(pout.role_lost == oracle_lost);
+            /* T02 (audit M1 survived): the OUTPUT FUNCTION too. DAV is
+             * asserted exactly in STRS (488.1 2.3.3: SDYS waits, STRS
+             * drives DAV, SWNS held until DAC, SGNS sources). */
+            CHECK(pout.dav_requested ==
+                  (prod.state == GPIB_SH_STRS));
+            /* byte_accepted fires exactly on the STRS->SWNS transition
+             * (the acceptor released DAC while we held DAV). */
+            CHECK(pout.byte_accepted ==
+                  (state == (int)GPIB_SH_STRS &&
+                   prod.state == GPIB_SH_SWNS));
         }
     }
 }

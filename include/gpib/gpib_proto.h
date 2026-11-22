@@ -1,3 +1,12 @@
+/**
+ * @file gpib_proto.h
+ * @brief Interface-function FSM types and wire-encoding helpers.
+ *
+ * Contains the state enums, input/output structs, and init/step
+ * functions for all IEEE 488.1 interface functions: SH, AH, T/TE,
+ * L/LE, SR, RL, DC, DT, C (5 groups), PP (both groups). Also
+ * provides the ATN command decoder and byte-encoding helpers.
+ */
 #ifndef GPIB_PROTO_H
 #define GPIB_PROTO_H
 

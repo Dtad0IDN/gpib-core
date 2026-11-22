@@ -1,3 +1,11 @@
+/**
+ * @file gpib_cfg.h
+ * @brief Compile-time configuration knobs for the core profile.
+ *
+ * Controls role (Controller/Device), ledger sizes, process budget,
+ * trace ring capacity, and simulated line timings. All knobs have
+ * #ifndef guards; limits never change the mandatory function set.
+ */
 #ifndef GPIB_CFG_H
 #define GPIB_CFG_H
 

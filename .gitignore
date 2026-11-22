@@ -1,0 +1,6 @@
+build/
+doc/
+tools/
+tests/
+build.ps1
+Doxyfile

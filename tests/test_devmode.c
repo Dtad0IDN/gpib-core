@@ -335,6 +335,131 @@ static void dv_d01_spas_abort(void) {
     CHECK(gpib_deinit(&ctx) == GPIB_OK);
 }
 
+/* DV-06 (audit NV: helper response lifetime): the response pointer
+ * from gpib_4882_response() must stay valid and unchanged while the
+ * device supply action holds zero-copy ownership of the buffer -- the
+ * integration must not modify it before ACK. */
+static void dv_06_response_lifetime(void) {
+    GPIB_CONTEXT_STORAGE_DEFINE(ctx);
+    mock_ctrl_port_t port;
+    gpib_handle_t t = { 0, 0, 0, 0, 0 };
+    gpib_handle_t b = { 0, 0, 0, 0, 0 };
+    gpib_result_t res;
+    gpib_4882_t mod;
+    static const char prog[] = "*IDN?\n";
+    int guard = 0;
+    const char *resp1;
+    size_t len1 = 0;
+    start_dev(&ctx, &port);
+    gpib_4882_init(&mod, "KILO,GPIB-CORE,0,1.0");
+    /* Program the query and let module E produce the response. */
+    CHECK(gpib_device_sink(&ctx, s_sink, sizeof(s_sink), &t, &b) ==
+          GPIB_OK);
+    mock_ctrl_write(&port, 5, (const uint8_t *)prog, sizeof(prog) - 1u);
+    while ((gpib_result_peek(&ctx, t, &res) != GPIB_OK ||
+            res.bytes_confirmed == 0) && guard++ < 20000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    CHECK(guard < 20000);
+    CHECK(gpib_4882_feed(&mod, (const char *)s_sink,
+                         res.bytes_confirmed));
+    resp1 = gpib_4882_response(&mod, &len1);
+    REQUIRE(resp1 != NULL);
+    REQUIRE(len1 == 20u); /* the identity string */
+    CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
+    CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
+    /* Supply the helper's response buffer DIRECTLY (true zero-copy: the
+     * audit correctly noted that copying to supply_buf tested stability,
+     * not ownership -- the core holds a borrowed pointer to the helper's
+     * internal buffer through the entire bus exchange). */
+    CHECK(gpib_device_supply(&ctx, (const uint8_t *)resp1, len1,
+                             &t, &b) == GPIB_OK);
+    /* While the supply is in flight, the helper's response buffer must
+     * stay untouched (zero-copy: the supply action reads it). */
+    {
+        const char *resp2;
+        size_t len2 = 0;
+        for (int i = 0; i < 100; i++) {
+            CHECK(gpib_process(&ctx) == GPIB_OK);
+        }
+        resp2 = gpib_4882_response(&mod, &len2);
+        CHECK(resp2 == resp1); /* same pointer, no reallocation */
+        CHECK(len2 == len1);   /* same length, no truncation */
+        /* The helper's buffer bytes are what the mock receives. */
+        for (size_t i = 0; i < len2; i++) {
+            CHECK((uint8_t)resp2[i] == (uint8_t)resp1[i]);
+        }
+    }
+    /* Complete the supply. */
+    mock_ctrl_read(&port, 5, len1);
+    guard = 0;
+    while ((!port.c.done || gpib_result_peek(&ctx, t, &res) != GPIB_OK) &&
+           guard++ < 20000) {
+        CHECK(gpib_process(&ctx) == GPIB_OK);
+    }
+    CHECK(guard < 20000);
+    CHECK(res.reason == GPIB_TERM_COMPLETED);
+    CHECK(res.bytes_confirmed == len1);
+    /* The helper buffer is STILL valid after the supply completes
+     * (zero-copy: the same pointer, same bytes). */
+    {
+        const char *resp3 = gpib_4882_response(&mod, &len1);
+        CHECK(resp3 == resp1);
+        CHECK(memcmp(resp3, resp1, len1) == 0);
+    }
+    gpib_4882_response_consumed(&mod);
+    CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
+    CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
+    CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
+    CHECK(gpib_process(&ctx) == GPIB_OK);
+    CHECK(gpib_deinit(&ctx) == GPIB_OK);
+}
+
+/* DV-07 (is_rx for multi-block DEV_RX): the second sink block must get
+ * is_rx=true like the first, so gpib_result_view would expose its data
+ * before ACK. The submit_block path used to set is_rx=false (only
+ * READ was checked). Direct flag check: the full multi-block DEV_RX
+ * bus exchange is a separate integration concern. */
+static void dv_07_multiblock_dev_rx_is_rx(void) {
+    GPIB_CONTEXT_STORAGE_DEFINE(ctx);
+    mock_ctrl_port_t port;
+    gpib_handle_t t = { 0, 0, 0, 0, 0 };
+    gpib_handle_t b1 = { 0, 0, 0, 0, 0 };
+    gpib_handle_t b2 = { 0, 0, 0, 0, 0 };
+    static uint8_t sink1[4];
+    static uint8_t sink2[4];
+    start_dev(&ctx, &port);
+    CHECK(gpib_device_sink(&ctx, sink1, 4, &t, &b1) == GPIB_OK);
+    CHECK(gpib_submit_block(&ctx, t, sink2, 4, &b2) == GPIB_OK);
+    /* Both blocks carry is_rx=true (the mutation flips it to false). */
+    CHECK(ctx.block[b1.slot].is_rx == true);
+    CHECK(ctx.block[b2.slot].is_rx == true);
+    /* Clean up: cancel the txn and drain. */
+    CHECK(gpib_request_cancel(&ctx, t) == GPIB_OK);
+    {
+        gpib_result_t res;
+        int guard = 0;
+        while (gpib_result_peek(&ctx, t, &res) != GPIB_OK &&
+               guard++ < 20000) {
+            CHECK(gpib_process(&ctx) == GPIB_OK);
+        }
+        REQUIRE(guard < 20000);
+    }
+    CHECK(gpib_result_ack(&ctx, b2) == GPIB_OK || b2.generation == 0u);
+    CHECK(gpib_result_ack(&ctx, b1) == GPIB_OK || b1.generation == 0u);
+    CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
+    CHECK(gpib_request_shutdown(&ctx) == GPIB_OK);
+    {
+        int guard = 0;
+        while (ctx.lifecycle != (uint8_t)GPIB_LC_DRAINING &&
+               guard++ < 20000) {
+            CHECK(gpib_process(&ctx) == GPIB_OK);
+        }
+        REQUIRE(guard < 20000);
+    }
+    CHECK(gpib_deinit(&ctx) == GPIB_OK);
+}
+
 void suite_devmode(void) {
     dv_01_supply();
     dv_02_sink();
@@ -342,6 +467,8 @@ void suite_devmode(void) {
     dv_04_module_e();
     dv_05_df_overflow_fault();
     dv_d01_spas_abort();
+    dv_06_response_lifetime();
+    dv_07_multiblock_dev_rx_is_rx();
 }
 
 #else /* controller build: negative surface only */

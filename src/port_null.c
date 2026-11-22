@@ -1,3 +1,7 @@
+/**
+ * @file port_null.c
+ * @brief Null port: no hardware, always detached, always quiescent. Used by lifecycle/ledger tests.
+ */
 #include <stddef.h>
 
 #include "gpib/gpib_port.h"

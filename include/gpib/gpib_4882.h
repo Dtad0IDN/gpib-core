@@ -1,3 +1,13 @@
+/**
+ * @file gpib_4882.h
+ * @brief IEEE 488.2 Module E helper: common-command status model.
+ *
+ * Implements the ESR/ESE/SRE/STB/MSS status reporting, the 12
+ * standard common commands (*CLS *ESE *ESR? *IDN? *OPC *RST *SRE
+ * *STB? *TST? *WAI), and the Response Message output queue with
+ * QYE semantics. Designed as an integration helper for the device
+ * role; NOT a full 488.2 parser.
+ */
 #ifndef GPIB_4882_H
 #define GPIB_4882_H
 

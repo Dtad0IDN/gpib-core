@@ -1,3 +1,10 @@
+/**
+ * @file gpib_types.h
+ * @brief Public type definitions: statuses, enums, handles, results.
+ *
+ * All enums and structs are documented; numeric values are NOT a stable
+ * ABI ([O] OPEN-26) — only the symbolic names are part of the API.
+ */
 #ifndef GPIB_TYPES_H
 #define GPIB_TYPES_H
 

@@ -44,7 +44,9 @@ static void addr_01(void) {
     CHECK(gpib_request_cancel(&ctx, t) == GPIB_OK);
     CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
     CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
-    gpib_address_t with_sec = { 6, 0x1f, true }; /* SAD(31) valid */
+    gpib_address_t with_sec = { 6, 0x1e, true }; /* SAD(30) valid (A-01:
+                                                    * SAD(31)=0x7F is not
+                                                    * an MSA) */
     r = make_write(&with_sec);
     CHECK(gpib_submit(&ctx, &r, &t, &b) == GPIB_OK);
     CHECK(gpib_request_cancel(&ctx, t) == GPIB_OK);
@@ -200,6 +202,11 @@ static void addr_07(void) {
     CHECK(!gpib_address_supported(&(gpib_address_t){ 31, 0, false }));
     CHECK(!gpib_address_supported(&(gpib_address_t){ 32, 0, false }));
     CHECK(!gpib_address_supported(&(gpib_address_t){ 255, 0, false }));
+    /* A-01: secondary 31 is NOT valid -- SAD(31)=0x7F is not an MSA
+     * (SCG 0x60-0x7E are MSAs). */
+    CHECK(gpib_address_supported(&(gpib_address_t){ 5, 30, true }));
+    CHECK(!gpib_address_supported(&(gpib_address_t){ 5, 31, true }));
+    CHECK(!gpib_address_supported(&(gpib_address_t){ 5, 32, true }));
     gpib_request_t r = make_write(&(gpib_address_t){ 31, 0, false });
     CHECK(gpib_submit(&ctx, &r, &t, &b) == GPIB_UNSUPPORTED_ADDRESSING);
 

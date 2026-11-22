@@ -1,3 +1,7 @@
+/**
+ * @file proto.c
+ * @brief IEEE 488.1 interface-function FSMs: SH, AH, T/TE, L/LE, SR, RL, DC, DT, C (5 groups), PP (both groups), ATN command decoder.
+ */
 #include "gpib/gpib_proto.h"
 
 /* --- ATN command decoding (--4 of the normative baseline) ----------------- */
@@ -903,6 +907,7 @@ void gpib_pp_step(gpib_pp_t *pp, const gpib_pp_in_t *in, gpib_pp_out_t *out) {
 
 void gpib_sh_init(gpib_sh_t *sh) {
     sh->state = GPIB_SH_SIDS; /* pon */
+    sh->t1_start_us = 0;
     sh->t1_deadline_us = 0;
     sh->in_flight = false;
     sh->require_dac_low = false;
@@ -1008,6 +1013,7 @@ void gpib_sh_step(gpib_sh_t *sh, const gpib_sh_in_t *in, gpib_sh_out_t *out) {
 
 void gpib_ah_init(gpib_ah_t *ah) {
     ah->state = GPIB_AH_AIDS; /* pon */
+    ah->t3_start_us = 0;
     ah->t3_deadline_us = 0;
 }
 
