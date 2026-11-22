@@ -1,6 +1,10 @@
 # gpib-core
 
+[English](README.md) | [???????](README_RU.md)
+
 Portable IEEE 488.1/488.2 (GPIB) protocol core for MCU targets.
+
+**[Quickstart (EN)](QUICKSTART.md) | [Quickstart (RU)](QUICKSTART_RU.md)**
 
 - **Language:** C11, zero heap, single static context (2408/1216 bytes full/min)
 - **Roles:** Controller and Device from one codebase (`GPIB_CFG_ROLE`)
