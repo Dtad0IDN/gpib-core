@@ -152,7 +152,9 @@ gpib_status_t gpib_deinit(gpib_context_t *ctx);
 /**
  * Emergency stop: idempotent electrical inhibit of own outputs plus latched
  * fault; never an implicit IFC/DCL; results report uncertainty (REQ-041/042,
- * RECOVERY_CONTRACT --3). Bounded, allocation-free: ISR-safe subset.
+ * RECOVERY_CONTRACT --3). Bounded, allocation-free. NOT ISR-safe: see the
+ * thread/ISR contract at the top of this file -- from an ISR only
+ * port->emergency_inhibit plus a port event are legal.
  */
 gpib_status_t gpib_emergency_stop(gpib_context_t *ctx);
 
@@ -349,6 +351,21 @@ gpib_status_t gpib_requestctl_pass(gpib_context_t *ctx, const uint8_t *addrs,
  */
 gpib_status_t gpib_request_cancel(gpib_context_t *ctx, gpib_handle_t txn);
 
+/* POLICY (audit NV: DF-event overflow): the device-function event ring
+ * (remote/local transitions, clear/trigger) is a DIAGNOSTIC channel.
+ * Overflow latches a fault (GPIB_FAULT_DF_EVENT_LOST, visible in
+ * gpib_query_status) but does NOT stop the instance: these events do
+ * not affect bus correctness, and halting the protocol over a lost
+ * diagnostic would trade a recoverable condition for a bus hang. The
+ * APPLICATION polls the fault latch and decides.
+ *
+ * POLICY (audit NV: TX block boundaries): each TX block (the first via
+ * submit, the rest via submit_block) is a COMPLETE message: the core
+ * sends its own SEND SETUP, the bytes, and END (EOI on the last byte).
+ * A submit_block therefore starts a NEW bus message, never appends to
+ * the previous one; RX blocks are the opposite (one RECEIVE per
+ * response message, F05 stream sessions). */
+
 /**
  * Own-address configuration; unsupported forms are rejected without touching
  * the active configuration (ADDR-06).
@@ -357,7 +374,8 @@ gpib_status_t gpib_set_address(gpib_context_t *ctx, gpib_address_t address);
 
 /**
  * Address-range contract shared by every submit path: primary 0..30 (31 is
- * the reserved UNL/UNT encoding), secondary 0..31 when present. Pure
+ * the reserved UNL/UNT encoding), secondary 0..30 when present (SAD(31)
+ * = 0x7F is not an MSA per 488.1). Pure
  * function -- safe to call before building address lists (ADDR-07).
  */
 bool gpib_address_supported(const gpib_address_t *a);

@@ -57,6 +57,21 @@ static void tc_01_pass_control(void) {
         CHECK(gpib_process(&ctx_b) == GPIB_OK);
     }
     CHECK(vbus_level(&bus.bus, VBL_ATN));
+    /* L-04 regression (final static audit): after PASSING control away,
+     * the OLD core's ATN contribution must be ZERO -- we_drive_atn used
+     * to survive the TCT completion (release_hold_atn doesn't clear
+     * it), and the old CIC held ATN forever from CIDS, wedging every
+     * multi-controller bus. The wire shows ATN only because the NEW
+     * CIC (B) asserts it. */
+    CHECK(!ctx_a.line.we_drive_atn);
+    {
+        /* Direct evidence: A's vbus participant mask must not include
+         * ATN after a few more idle rounds. */
+        for (int i = 0; i < 5; i++) {
+            CHECK(gpib_process(&ctx_a) == GPIB_OK);
+        }
+        CHECK((bus.bus.assert_mask[0] & (1u << (int)VBL_ATN)) == 0u);
+    }
     /* Receiver saw MTA(2) then TCT (service channel got TCT). */
     {
         uint8_t cmd = 0;

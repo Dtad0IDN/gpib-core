@@ -1,3 +1,7 @@
+/**
+ * @file executor.c
+ * @brief Action lifecycle (PUBLISHED->ACTIVE->QUIESCED->ACCOUNTED), event consumption, stop paths, per-block accounting, stream-session arbitration.
+ */
 #include <stddef.h>
 #include <string.h>
 #include "gpib_internal.h"
@@ -9,6 +13,13 @@ bool gpib_action_busy(const struct gpib_context *ctx) {
     return st == (uint8_t)GPIB_ACTION_PUBLISHED || st == (uint8_t)GPIB_ACTION_ACTIVE;
 }
 
+/**
+ * @brief Pick the next queued block by FIFO sequence and dispatch it.
+ * @param ctx Instance context.
+ * @return true if an action was published.
+ * @note Dispatch order is submit-order (R17-01), not physical slot.
+ *       Session ownership arbitrates foreign txns (N11-01).
+ */
 bool gpib_executor_try_publish(struct gpib_context *ctx) {
     if (gpib_action_busy(ctx)) {
         return false;
@@ -20,17 +31,30 @@ bool gpib_executor_try_publish(struct gpib_context *ctx) {
     if (gpib_line_mode(ctx) &&
         (ctx->line.ctrl.main == GPIB_C_CIDS ||
          ctx->line.ctrl.ifc == GPIB_C_SIAS || ctx->ifc_request)) {
-        /* No CIC, or the power-on/re-seize IFC pulse is still on the wire
-         * (C4a: including the REQUESTED-but-not-yet-asserted window --
-         * the gate used to check only the FSM state, which lags the
-         * request by a round):
-         * "The controller shall not execute any other control sequences
-         * until IFC has been made FALSE" (488.2 16.2.8). The action stays
-         * CORE_QUEUED until the FSM holds CIC with the pulse completed
-         * (byte-pump ports have no FSM stepping and are not gated). */
         return false;
     }
 #endif
+    /* PERF (weak-MCU): short-circuit the common idle case -- the scan
+     * below is O(MAX_OPERATIONS x MAX_BLOCKS) even when nothing is
+     * queued. A single pass counts OPEN txns with a CORE_QUEUED block
+     * and falls through only when work exists. */
+    {
+        bool has_work = false;
+        for (int t = 0; t < GPIB_CFG_MAX_OPERATIONS && !has_work; t++) {
+            if (ctx->txn[t].state != TXN_OPEN) {
+                continue;
+            }
+            for (int b = 0; b < GPIB_CFG_MAX_BLOCKS; b++) {
+                if (ctx->block[b].state == BLOCK_CORE_QUEUED) {
+                    has_work = true;
+                    break;
+                }
+            }
+        }
+        if (!has_work) {
+            return false;
+        }
+    }
     for (int t = 0; t < GPIB_CFG_MAX_OPERATIONS; t++) {
         struct gpib_txn_record *tr = &ctx->txn[t];
         if (tr->state != TXN_OPEN) {
@@ -323,6 +347,11 @@ static void consume_event(struct gpib_context *ctx, const gpib_port_event_t *ev)
     }
 }
 
+/**
+ * @brief Advance the current action one step (event, deadline, FSM, or byte-pump).
+ * @param ctx Instance context.
+ * @return true while the action is still active.
+ */
 bool gpib_executor_step(struct gpib_context *ctx) {
     struct gpib_action *a = &ctx->action;
     const struct gpib_port *port = ctx->port;
@@ -407,6 +436,9 @@ bool gpib_executor_step(struct gpib_context *ctx) {
     return true;
 }
 
+static void gpib_txn_after_block_terminal(struct gpib_context *ctx,
+    uint16_t slot);
+
 void gpib_executor_account(struct gpib_context *ctx) {
     struct gpib_action *a = &ctx->action;
     struct gpib_block_record *b = &ctx->block[a->block_slot];
@@ -431,7 +463,6 @@ void gpib_executor_account(struct gpib_context *ctx) {
     if (b->quarantined) {
         return; /* no safe result exists; block stays pinned (LED-04) */
     }
-    b->state = BLOCK_WAIT_QUIESCENCE;
     /* ACTION_QUIESCED proven synchronously in this host model: */
     b->state = BLOCK_ACCOUNTABLE;
     b->result.status = GPIB_OK;
@@ -494,7 +525,8 @@ void gpib_executor_account(struct gpib_context *ctx) {
     gpib_txn_after_block_terminal(ctx, a->txn_slot);
 }
 
-void gpib_txn_after_block_terminal(struct gpib_context *ctx, uint16_t slot) {
+static void gpib_txn_after_block_terminal(struct gpib_context *ctx,
+    uint16_t slot) {
     struct gpib_txn_record *t = &ctx->txn[slot];
     if (t->state != TXN_OPEN && t->state != TXN_FINISHING) {
         return;

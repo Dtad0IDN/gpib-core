@@ -1,3 +1,13 @@
+/**
+ * @file gpib_storage.h
+ * @brief Static context layout: transaction ledger, block records,
+ * action state, and all persistent sequencer/FSM state.
+ *
+ * The GPIB_CONTEXT_STORAGE_DEFINE macro creates a correctly-sized
+ * static storage object for placement-new initialization. The storage
+ * fingerprint validates that the caller and the library agree on the
+ * compiled configuration.
+ */
 #ifndef GPIB_STORAGE_H
 #define GPIB_STORAGE_H
 

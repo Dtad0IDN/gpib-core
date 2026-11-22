@@ -1,3 +1,11 @@
+/**
+ * @file gpib_port.h
+ * @brief Level-2 port contract: the ONLY hardware contact surface.
+ *
+ * Defines the port callback interface, the G1-G5 guarantees a real
+ * adapter must provide, line-level snapshot/drive structures, and the
+ * port event queue. See the comments below for the full contract.
+ */
 #ifndef GPIB_PORT_H
 #define GPIB_PORT_H
 

@@ -1,3 +1,7 @@
+/**
+ * @file submit.c
+ * @brief Request submission, per-kind validation and staging, protocol API wrappers (write, read, spoll, allspoll, findrqs, reset, TCT, SEND COMMAND, PPOLL configure/unconfigure, FINDLSTN, REQUESTCTL).
+ */
 #include <stddef.h>
 #include <string.h>
 
@@ -392,10 +396,8 @@ gpib_status_t gpib_submit(gpib_context_t *ctx, const gpib_request_t *req,
     memset(&br->result, 0, sizeof(br->result));
     *txn_out = gpib_make_handle(ctx, (uint8_t)GPIB_HANDLE_TXN, (uint16_t)t,
         tr->generation);
-    if (first_block_out != NULL) {
-        *first_block_out = gpib_make_handle(ctx, (uint8_t)GPIB_HANDLE_BLOCK,
-            (uint16_t)b, br->generation);
-    }
+    *first_block_out = gpib_make_handle(ctx, (uint8_t)GPIB_HANDLE_BLOCK,
+        (uint16_t)b, br->generation);
     GPIB_TRACE(ctx, GPIB_TRC_SUBMIT, (uint16_t)t, tr->generation, 0);
     return GPIB_OK;
 }
@@ -652,11 +654,12 @@ gpib_status_t gpib_requestctl_pass(gpib_context_t *ctx, const uint8_t *addrs,
         gpib_process(ctx);
     }
     if (guard >= 40000) {
-        /* F06: the FINDRQS poll_results buffer lives on OUR stack -- an
-         * unowned RUNNING action would keep writing into it after the
-         * return. Cancel the transaction and drain it to a terminal
-         * state before leaving; if even the drain wedges (stuck port),
-         * the action is stop-latched, not polling. */
+        /* F06: the FINDRQS poll_results buffer is INSTANCE memory
+         * (ctx->requestctl_results, R6-04) -- an unowned RUNNING action
+         * would keep writing into it after the return. Cancel the
+         * transaction and drain it to a terminal state before leaving;
+         * if even the drain wedges (stuck port), the action is
+         * stop-latched, not polling. */
         (void)gpib_request_cancel(ctx, fq_t);
         int drain = 0;
         while (gpib_result_peek(ctx, fq_t, &fq_res) != GPIB_OK &&
@@ -742,7 +745,8 @@ gpib_status_t gpib_submit_block(gpib_context_t *ctx, gpib_handle_t txn,
     br->txn_seq = tr->next_block_seq++; /* R17-01: FIFO order */
     br->data = (const uint8_t *)data;
     br->len = len;
-    br->is_rx = (tr->kind == GPIB_REQ_READ);
+    br->is_rx = (tr->kind == GPIB_REQ_READ ||
+                 tr->kind == GPIB_REQ_DEV_RX); /* consistent with first block */
     memset(&br->result, 0, sizeof(br->result));
     tr->block_count++;
     *block_out = gpib_make_handle(ctx, (uint8_t)GPIB_HANDLE_BLOCK,

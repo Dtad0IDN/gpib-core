@@ -1,3 +1,7 @@
+/**
+ * @file results.c
+ * @brief Result peek/ack/view, handle validation, block/transaction record lifecycle transitions.
+ */
 #include <string.h>
 
 #include "gpib_internal.h"

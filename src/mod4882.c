@@ -1,3 +1,7 @@
+/**
+ * @file mod4882.c
+ * @brief IEEE 488.2 Module E helper: common-command execution, status model, response queue.
+ */
 #include <string.h>
 
 #include "gpib/gpib_4882.h"

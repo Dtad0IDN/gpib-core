@@ -1,3 +1,7 @@
+/**
+ * @file ledger.c
+ * @brief Transaction and block record management: reservation, terminalization, free-slot finding, result publication.
+ */
 #include <stddef.h>
 
 #include "gpib_internal.h"

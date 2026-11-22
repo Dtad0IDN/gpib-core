@@ -1,22 +1,26 @@
+/**
+ * @file core.c
+ * @brief Lifecycle API, init/start/process/shutdown/deinit, emergency stop, diagnostics, device-role API surfaces (STB, SRQ, local, PP1 ist).
+ */
 #include <string.h>
 
 #include "gpib_internal.h"
 
-/* REQ-078/079: this build has no TE/LE interface functions, so a present
- * secondary must fail loudly before any bus action or ownership capture.
- * Value ranges await the normative baseline (OPEN-01/02); the Keysight
- * 0..30 documentation is deliberately not treated as a norm. */
+/* Address-range contract shared by every submit path: primary 0..30 (31 is
+ * the reserved UNL/UNT encoding), secondary 0..30 when present. */
 bool gpib_address_supported(const gpib_address_t *a) {
     /* Primary address space is 0..30 (F12): 31 is reserved -- its
      * encodings are UNL (0x3F) and UNT (0x5F) -- and larger values alias
      * into other command groups through the 5-bit address field.
      * TE/LE is implemented: secondary addresses are supported when the
-     * value is 0..31 (the SAD encoding space; SAD(n) = 0x60|n). The
-     * REQ-078/079 reservation is honoured: absence only via the flag. */
+     * value is 0..30 for BOTH primary and secondary: SAD(31)=0x7F is
+     * NOT a valid MSA per 488.1 (SCG 0x60-0x7E are MSAs; 0x7F is
+     * reserved). The REQ-078/079 reservation is honoured: absence only
+     * via the flag. */
     if (a->primary > 30u) {
         return false;
     }
-    if (a->secondary_present && a->secondary > 31u) {
+    if (a->secondary_present && a->secondary > 30u) {
         return false;
     }
     return true;
@@ -52,7 +56,7 @@ static void wipe(struct gpib_context *ctx) {
  * configuration, which includes the own-address setup. */
 void gpib_apply_own_address(struct gpib_context *ctx) {
     bool has_sec = ctx->own_address.secondary_present &&
-                   ctx->own_address.secondary <= 31u;
+                   ctx->own_address.secondary <= 30u; /* A-01: SAD(31)=0x7F is not MSA */
     gpib_addr_init(&ctx->line.addr, ctx->own_address.primary);
     gpib_talker_init_ex(&ctx->line.tk,
         ctx->own_address.primary, true, false,
@@ -62,6 +66,13 @@ void gpib_apply_own_address(struct gpib_context *ctx) {
         has_sec, ctx->own_address.secondary);
 }
 
+/**
+ * @brief Initialize the instance: validate, assign identity, zero FSMs.
+ * @param ctx Instance context storage.
+ * @param params Immutable initialization parameters.
+ * @return GPIB_OK, or INVALID_ARGUMENT/UNSUPPORTED_ADDRESSING/RESOURCE_EXHAUSTED.
+ * @note No protocol exchange occurs (LIF-01); repeated init is rejected.
+ */
 gpib_status_t gpib_init(gpib_context_t *ctx, const gpib_init_params_t *params) {
     if (ctx == NULL || params == NULL) {
         return GPIB_INVALID_ARGUMENT;
@@ -110,6 +121,11 @@ gpib_status_t gpib_init(gpib_context_t *ctx, const gpib_init_params_t *params) {
     return GPIB_OK;
 }
 
+/**
+ * @brief Transition INITIALIZED -> RUNNING via bounded port arm.
+ * @param ctx Instance context.
+ * @return GPIB_OK, or PORT_ERROR if the port arm fails (stays INITIALIZED).
+ */
 gpib_status_t gpib_start(gpib_context_t *ctx) {
     if (ctx == NULL) {
         return GPIB_INVALID_ARGUMENT;
@@ -158,6 +174,11 @@ gpib_status_t gpib_poll_device_event(gpib_context_t *ctx, uint8_t *cmd_byte) {
     return GPIB_OK;
 }
 
+/**
+ * @brief Asynchronous shutdown request; idempotent in STOPPING.
+ * @param ctx Instance context.
+ * @return GPIB_OK, or ALREADY_STOPPING/ALREADY_STOPPED for repeats.
+ */
 gpib_status_t gpib_request_shutdown(gpib_context_t *ctx) {
     if (ctx == NULL) {
         return GPIB_INVALID_ARGUMENT;
@@ -176,6 +197,13 @@ gpib_status_t gpib_request_shutdown(gpib_context_t *ctx) {
     }
 }
 
+/**
+ * @brief Bounded owner-side advance of internal work.
+ * @param ctx Instance context.
+ * @return GPIB_OK always (PROGRESS_CONTRACT).
+ * @note Call from the main loop; advances up to GPIB_CFG_PROCESS_BUDGET
+ *       bus exchanges per invocation.
+ */
 gpib_status_t gpib_process(gpib_context_t *ctx) {
     if (ctx == NULL) {
         return GPIB_INVALID_ARGUMENT;
@@ -191,44 +219,39 @@ gpib_status_t gpib_process(gpib_context_t *ctx) {
         return GPIB_OK;
     case GPIB_LC_RUNNING:
         /* One bounded owner slice: account -> publish -> step (PRG-02). */
-        for (int budget = GPIB_CFG_PROCESS_BUDGET; budget > 0; budget--) {
-            /* AUD-04: deadlines bind ACCEPTED TRANSACTIONS, not only the
-             * dispatched action. An OPEN stream waiting for its next RX
-             * buffer or queued behind the session/CIC gates used to run
-             * forever although the application set a deadline. Line mode
-             * only: byte-pump actions dispatch immediately and their own
-             * deadline latch in executor_step covers them. */
-            if (gpib_line_mode(ctx)) {
-                uint64_t now = ctx->port->now_us(ctx->port->user);
-                for (int i = 0; i < GPIB_CFG_MAX_OPERATIONS; i++) {
-                    struct gpib_txn_record *tr = &ctx->txn[i];
-                    if (tr->state != TXN_OPEN || tr->deadline_us == 0) {
-                        continue;
-                    }
-                    /* A dispatched action carries the same deadline and
-                     * ends through the executor's stop path (which also
-                     * cuts the in-flight byte safely); do not race it. */
-                    if ((ctx->action.state ==
-                             (uint8_t)GPIB_ACTION_ACTIVE ||
-                         ctx->action.state ==
-                             (uint8_t)GPIB_ACTION_PUBLISHED) &&
-                        ctx->action.txn_slot == (uint16_t)i) {
-                        continue;
-                    }
-                    if (now < tr->deadline_us) {
-                        continue;
-                    }
-                    if (ctx->line.rx_session_open &&
-                        ctx->line.rx_session_slot == (uint16_t)i &&
-                        ctx->line.rx_session_gen == tr->generation) {
-                        ctx->line.rx_session_open = false;
-                    }
-                    tr->state = TXN_FINISHING;
-                    gpib_ledger_terminalize_txn_blocks(ctx, (uint16_t)i);
-                    gpib_ledger_try_publish_txn(ctx, (uint16_t)i, GPIB_OK,
-                        GPIB_TERM_TIMEOUT, GPIB_END_NONE);
+        /* PERF (weak-MCU): the AUD-04 deadline sweep runs ONCE per
+         * process call, not per budget iteration -- the deadlines are
+         * absolute; a one-slice delay changes nothing (the dispatched
+         * action's own latch in executor_step covers it per-step).
+         * 8 iterations x 4 slots -> 1 scan, one now_us port call. */
+        if (gpib_line_mode(ctx)) {
+            uint64_t now = ctx->port->now_us(ctx->port->user);
+            for (int i = 0; i < GPIB_CFG_MAX_OPERATIONS; i++) {
+                struct gpib_txn_record *tr = &ctx->txn[i];
+                if (tr->state != TXN_OPEN || tr->deadline_us == 0) {
+                    continue;
                 }
+                if ((ctx->action.state == (uint8_t)GPIB_ACTION_ACTIVE ||
+                     ctx->action.state ==
+                         (uint8_t)GPIB_ACTION_PUBLISHED) &&
+                    ctx->action.txn_slot == (uint16_t)i) {
+                    continue;
+                }
+                if (now < tr->deadline_us) {
+                    continue;
+                }
+                if (ctx->line.rx_session_open &&
+                    ctx->line.rx_session_slot == (uint16_t)i &&
+                    ctx->line.rx_session_gen == tr->generation) {
+                    ctx->line.rx_session_open = false;
+                }
+                tr->state = TXN_FINISHING;
+                gpib_ledger_terminalize_txn_blocks(ctx, (uint16_t)i);
+                gpib_ledger_try_publish_txn(ctx, (uint16_t)i, GPIB_OK,
+                    GPIB_TERM_TIMEOUT, GPIB_END_NONE);
             }
+        }
+        for (int budget = GPIB_CFG_PROCESS_BUDGET; budget > 0; budget--) {
             if (ctx->action.state == (uint8_t)GPIB_ACTION_QUIESCED) {
                 gpib_executor_account(ctx);
             }
@@ -286,6 +309,8 @@ gpib_status_t gpib_process(gpib_context_t *ctx) {
     gpib_term_reason_t cause = ctx->stop_request.active
         ? (gpib_term_reason_t)ctx->stop_request.cause
         : GPIB_TERM_SHUTDOWN;
+    /* Note: the FIRST stop cause wins -- a user cancel before shutdown
+     * terminalizes everything with CANCELED, not SHUTDOWN. */
     for (int i = 0; i < GPIB_CFG_MAX_OPERATIONS; i++) {
         struct gpib_txn_record *t = &ctx->txn[i];
         if (t->state == TXN_OPEN) {
@@ -316,6 +341,11 @@ gpib_status_t gpib_process(gpib_context_t *ctx) {
     return GPIB_OK;
 }
 
+/**
+ * @brief Non-blocking teardown; requires ledger drained + port detached.
+ * @param ctx Instance context.
+ * @return GPIB_OK, or BUSY_RESOURCES with last_busy_reason diagnostics.
+ */
 gpib_status_t gpib_deinit(gpib_context_t *ctx) {
     if (ctx == NULL) {
         return GPIB_INVALID_ARGUMENT;
@@ -352,7 +382,8 @@ gpib_status_t gpib_deinit(gpib_context_t *ctx) {
     }
 }
 
-gpib_status_t gpib_set_address(gpib_context_t *ctx, gpib_address_t address) {    if (ctx == NULL) {
+gpib_status_t gpib_set_address(gpib_context_t *ctx, gpib_address_t address) {
+    if (ctx == NULL) {
         return GPIB_INVALID_ARGUMENT;
     }
     if (ctx->lifecycle == GPIB_LC_UNINITIALIZED) {
@@ -498,7 +529,8 @@ gpib_status_t gpib_remote_enable(gpib_context_t *ctx, bool enable) {
     return GPIB_OK;
 }
 
-gpib_status_t gpib_query_status(gpib_context_t *ctx, gpib_status_info_t *out) {    if (ctx == NULL || out == NULL) {
+gpib_status_t gpib_query_status(gpib_context_t *ctx, gpib_status_info_t *out) {
+    if (ctx == NULL || out == NULL) {
         return GPIB_INVALID_ARGUMENT;
     }
     if (ctx->lifecycle == GPIB_LC_UNINITIALIZED) {

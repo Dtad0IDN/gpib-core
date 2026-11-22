@@ -1,3 +1,7 @@
+/**
+ * @file epoch.c
+ * @brief Instance identity: monotonic epoch counter for handle anti-aliasing.
+ */
 #include <stdint.h>
 
 #include "gpib_internal.h"

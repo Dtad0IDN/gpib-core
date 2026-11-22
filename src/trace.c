@@ -1,3 +1,7 @@
+/**
+ * @file trace.c
+ * @brief Binary trace ring: fixed-size records, oldest-drop overflow with counting.
+ */
 #include <string.h>
 
 #include "gpib_internal.h"

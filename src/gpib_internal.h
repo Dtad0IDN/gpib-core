@@ -64,10 +64,6 @@ bool gpib_executor_step(struct gpib_context *ctx);
  * record (unless quarantined), then RESULT_ACCOUNTED. */
 void gpib_executor_account(struct gpib_context *ctx);
 
-/* Transaction bookkeeping after a block became terminal: publishes the
- * transaction terminal record once all its accepted blocks are terminal. */
-void gpib_txn_after_block_terminal(struct gpib_context *ctx, uint16_t slot);
-
 /* Latch an instance fault with timestamps (RECOVERY_CONTRACT --4). */
 void gpib_fault_latch(struct gpib_context *ctx, gpib_fault_code_t code);
 

@@ -94,20 +94,39 @@ static void oracle_o1_write(void) {
     CHECK(peer.rx_len == 12);
     CHECK(memcmp(peer.rx, s_tx, 12) == 0);
     /* Waveform: every traced DAV byte ran under the right ATN phase and
-     * the LAST data byte carried EOI. */
-    bool saw_data_eoi = false;
-    for (size_t i = 0; i < peer.trace_len; i++) {
-        if (peer.trace[i].dav) {
-            if (peer.trace[i].atn) {
-                /* command byte: fine */
-            } else {
-                if (peer.trace[i].eoi) {
-                    saw_data_eoi = true;
-                }
+     * EOI accompanied EXACTLY the LAST data byte (T01: the old "at
+     * least one EOI" check let the every-byte-EOI mutation survive). */
+    {
+        /* T01 precise END check: anchor on the first round the LAST
+         * byte's DIO value appears on the wire (the source drives DIO
+         * during SGNS/SDYS settle, before DAV; EOI accompanies the
+         * whole final-byte window, not just the DAV assertion). */
+        uint8_t last_byte = s_tx[11];
+        size_t last_byte_first_round = 0;
+        bool found_last = false;
+        for (size_t i = 0; i < peer.trace_len; i++) {
+            if (!peer.trace[i].atn &&
+                peer.trace[i].dio == last_byte && !found_last) {
+                last_byte_first_round = i;
+                found_last = true;
             }
         }
+        CHECK(found_last);
+        bool saw_end = false;
+        for (size_t i = 0; i < peer.trace_len; i++) {
+            if (peer.trace[i].eoi && !peer.trace[i].atn) {
+                if (i < last_byte_first_round) {
+                    fprintf(stderr, "[eoi] round=%zu dav=%u dio=0x%02X "
+                        "last_first=%zu last_byte=0x%02X\n",
+                        i, peer.trace[i].dav, peer.trace[i].dio,
+                        last_byte_first_round, last_byte);
+                }
+                CHECK(i >= last_byte_first_round);
+                saw_end = true;
+            }
+        }
+        CHECK(saw_end); /* the END is present */
     }
-    CHECK(saw_data_eoi);
     oracle_assert_clean(&peer); /* DIO stability etc. */
     CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
     CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
@@ -302,6 +321,22 @@ static void oracle_o4_ppoll(void) {
     res = o_wait(&ctx, t);
     CHECK(res.reason == GPIB_TERM_COMPLETED);
     CHECK(res.stb == (1u << 4));
+    /* L-01 regression: scope the check to THIS poll's journal window --
+     * the whole test continues with Poll 2/unconfigure whose ATN
+     * sequences legitimately release the line. */
+    {
+        size_t dr_end = peer.dr_n; /* captured NOW, after poll 1 */
+        size_t last_idy = 0;
+        for (size_t i = 0; i < dr_end; i++) {
+            if (peer.dr_journal[i].atn && peer.dr_journal[i].eoi) {
+                last_idy = i;
+            }
+        }
+        REQUIRE(last_idy > 0);
+        for (size_t i = last_idy + 1u; i < dr_end; i++) {
+            CHECK(peer.dr_journal[i].atn == 1u); /* no gap after IDY */
+        }
+    }
     CHECK(gpib_result_ack(&ctx, b) == GPIB_OK);
     CHECK(gpib_result_ack(&ctx, t) == GPIB_OK);
     /* Poll 2: ist != S -> passive false: zero on the wire. */
